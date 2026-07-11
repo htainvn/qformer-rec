@@ -145,13 +145,18 @@ class RecBatch:
 
 
 class RecDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, id2title: dict[int, str], max_his: int = 10):
+    def __init__(self, df: pd.DataFrame, id2title: dict[int, str], max_his: int = 10,
+                 prompt_titles: int = 10):
         self.uid = df["uid"].to_numpy()
         self.iid = df["iid"].to_numpy()
         self.label = df["label"].to_numpy(dtype=np.float32)
         self.max_his = max_his
-        # cap history to the MOST RECENT max_his items (CoLLM order: oldest -> newest)
+        # cap history to the MOST RECENT max_his items (CoLLM order: oldest -> newest).
+        # max_his feeds SASRec/QFormer and may exceed the PROMPT's title list, which
+        # stays capped at prompt_titles (=10 per the CoLLM prompt template) — the
+        # collaborative encoder benefits from a longer view than the text can carry.
         self.his = [h[-max_his:] for h in df["his"]]
+        self.prompt_titles = prompt_titles
         self.id2title = id2title
 
     def __len__(self):
@@ -169,7 +174,8 @@ class RecDataset(Dataset):
             "label": float(self.label[idx]),
             "his": [PAD_ID] * pad + list(his),      # LEFT pad
             "his_mask": [0] * pad + [1] * len(his),
-            "his_titles": [self.title(i) for i in his],
+            # the prompt lists only the most recent titles (template cap = 10)
+            "his_titles": [self.title(i) for i in his[-self.prompt_titles:]],
             "target_title": self.title(self.iid[idx]),
         }
 
@@ -237,5 +243,6 @@ def load_data(cfg):
             tr, va, te, n_users, n_items, id2title = make_synthetic(seed=cfg.seed)
         else:
             tr, va, te, n_users, n_items, id2title = load_collm_ml1m(data_dir)
-    mk = lambda df: RecDataset(df, id2title, max_his=cfg.max_his_len)
+    mk = lambda df: RecDataset(df, id2title, max_his=cfg.max_his_len,
+                               prompt_titles=cfg.prompt_titles)
     return mk(tr), mk(va), mk(te), n_users, n_items, id2title

@@ -68,7 +68,7 @@ def train_phase0(cfg: Config, train_ds, val_ds, n_items, device) -> tuple[SASRec
     dl = make_loader(train_ds, cfg, cfg.phase0_batch_size, grouped=False, seed=cfg.seed)
 
     history = {"loss": [], "val_auc": [], "val_uauc": []}
-    best_auc, best_state = -1.0, None
+    best_auc, best_state, stale = -1.0, None, 0
     for epoch in range(cfg.phase0_epochs):
         sasrec.train()
         losses = []
@@ -85,8 +85,14 @@ def train_phase0(cfg: Config, train_ds, val_ds, n_items, device) -> tuple[SASRec
         print(f"[phase0] epoch {epoch + 1}/{cfg.phase0_epochs} "
               f"loss {history['loss'][-1]:.4f} val AUC {v_auc:.4f} val UAUC {v_uauc:.4f}")
         if v_auc > best_auc:
-            best_auc = v_auc
+            best_auc, stale = v_auc, 0
             best_state = {k: v.detach().cpu().clone() for k, v in sasrec.state_dict().items()}
+        else:
+            stale += 1
+            if stale >= cfg.phase0_patience:   # SASRec overfits fast on 34k rows;
+                print(f"[phase0] early stop at epoch {epoch + 1} "
+                      f"(no val-AUC gain for {stale} epochs)")
+                break
 
     sasrec.load_state_dict(best_state)
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)

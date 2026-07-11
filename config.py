@@ -13,18 +13,27 @@ import json
 class Config:
     # ---- data -------------------------------------------------------------
     data_dir: str = "ml-1m"          # CoLLM's preprocessed ML-1M pickles
-    max_his_len: int = 10            # history capped at 10, left-padded (pad idx 0)
+    # SASRec/QFormer history length (left-padded, pad 0). Decoupled from the
+    # 10-title prompt cap: sweep on real ML-1M val AUC peaked at L=100
+    # (0.6991 vs 0.6885 at L=10; L=150/200 decline) — the collaborative encoder
+    # needs a longer view than the prompt text can carry.
+    max_his_len: int = 100
+    prompt_titles: int = 10          # titles listed in the prompt text (template cap)
     smoke_test: bool = False         # tiny synthetic data + tiny backbone, CPU-friendly
 
     # ---- SASRec (collaborative backbone) -----------------------------------
+    # regularization matters here: with ~34k train rows SASRec overfits within
+    # a few epochs (val AUC peaks ~3 then declines while train loss -> 0.1),
+    # and a weak Phase-0 model caps the whole pipeline's UAUC
     emb_dim: int = 64                # item embedding dim
     sasrec_blocks: int = 2           # causal self-attention blocks
     sasrec_heads: int = 2
-    sasrec_dropout: float = 0.2
+    sasrec_dropout: float = 0.3
     phase0_lr: float = 1e-3
-    phase0_epochs: int = 30
+    phase0_epochs: int = 30          # upper bound; early stopping usually ends sooner
+    phase0_patience: int = 5         # stop after this many epochs w/o val-AUC gain
     phase0_batch_size: int = 256
-    phase0_weight_decay: float = 1e-6
+    phase0_weight_decay: float = 1e-4
     phase0_neg_ratio: int = 0        # 0 = use labeled samples as-is (CTR-style BCE)
 
     # ---- QFormer bridge -----------------------------------------------------
@@ -101,6 +110,7 @@ class Config:
         return cls(
             smoke_test=True,
             backbone="hf-internal-testing/tiny-random-gpt2",
+            max_his_len=10,          # synthetic histories are <= 10 anyway
             emb_dim=16,
             n_queries=2,
             qformer_layers=1,
