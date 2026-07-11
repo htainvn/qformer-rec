@@ -1,0 +1,11 @@
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# training artifacts
+checkpoints/
+
+# extracted data (ml-1m.zip is committed; data.py reads ml-1m/*.pkl after unzip)
+ml-1m/
