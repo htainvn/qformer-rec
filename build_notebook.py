@@ -69,8 +69,11 @@ md("""## 0 · Configuration
 `smoke_test=True` (default) runs the whole pipeline on tiny synthetic data with a tiny
 random GPT-2 backbone — CPU-only, a few minutes end-to-end. The clearly marked cell below
 switches to the full Vicuna-7B multi-seed run on the real ML-1M pickles (needs a GPU).""")
-code("""%load_ext autoreload
-%autoreload 2
+code("""try:                      # local-dev convenience; the autoreload extension is
+    %load_ext autoreload  # broken on Colab's Python 3.12 image ('imp' removed)
+    %autoreload 2
+except Exception:
+    pass
 
 import numpy as np, torch, matplotlib.pyplot as plt, json, warnings
 warnings.filterwarnings("ignore")
