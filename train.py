@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -116,7 +117,8 @@ def _val_scores(cfg, llm, sasrec, qformer, val_ds, device, hybrid):
     """Val scores for checkpoint selection; optionally on a fixed user subsample."""
     return score_dataset(llm, sasrec, qformer, val_ds,
                          batch_size=cfg.phase2_batch_size * 2,
-                         device=device, hybrid=hybrid)
+                         device=device, hybrid=hybrid,
+                         progress=not cfg.smoke_test)  # 7B over full val is minutes-long
 
 
 def _selection_val_set(cfg, val_ds):
@@ -152,6 +154,7 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                                   patience=cfg.patience, n_boot=cfg.n_boot, seed=cfg.seed)
     history = {"loss": [], "bce": [], "pair": []}
     step, stop = 0, False
+    t_last, step_last = time.time(), 0
     for epoch in range(epochs):
         if stop:
             break
@@ -177,6 +180,15 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
             if step % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 opt.step(); opt.zero_grad()
+            if step % cfg.log_every_steps == 0:
+                w = cfg.log_every_steps
+                rate = (step - step_last) / max(time.time() - t_last, 1e-9)
+                t_last, step_last = time.time(), step
+                print(f"[{tag}] epoch {epoch + 1} step {step}/{len(dl) * epochs} "
+                      f"loss {np.mean(history['loss'][-w:]):.4f} "
+                      f"(bce {np.mean(history['bce'][-w:]):.4f} "
+                      f"pair {np.mean(history['pair'][-w:]):.4f}) "
+                      f"{rate:.2f} step/s", flush=True)
             if step % cfg.eval_every_steps == 0:
                 uids, labels, scores = _val_scores(cfg, llm, sasrec, qformer, val_ds,
                                                    device, hybrid)
@@ -184,6 +196,7 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                                        tracked_state_fn())
                 llm.train(); qformer.train()
                 sasrec.train(cfg.unfreeze_sasrec and hybrid)
+                t_last, step_last = time.time(), step  # don't count eval in step/s
                 if stop:
                     print(f"[{tag}] early stop at step {step} (patience)")
                     break

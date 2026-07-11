@@ -64,6 +64,7 @@ class Config:
     users_per_batch: int = 4         # group sampler: users per batch (so same-user pairs exist)
 
     # ---- checkpoint selection ------------------------------------------------
+    log_every_steps: int = 50        # print running train loss every this many steps
     eval_every_steps: int = 200      # evaluate val AUC/UAUC every this many steps
     sel_window: int = 3              # moving-average window for smoothed val UAUC
     top_k_soup: int = 3              # weight-average the top-k checkpoints (model soup)
@@ -112,6 +113,7 @@ class Config:
             phase2_epochs=2,
             phase2_batch_size=4,
             phase2_grad_accum=1,
+            log_every_steps=10,
             eval_every_steps=20,
             sel_window=2,
             top_k_soup=2,
