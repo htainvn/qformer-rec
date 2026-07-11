@@ -62,13 +62,16 @@ class LLMRec(nn.Module):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         kwargs = {}
+        # T4/V100 (Colab free tier) have no bf16 support — fall back to fp16 there
+        half = (torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported()
+                else torch.float16)
         if load_4bit:
             from transformers import BitsAndBytesConfig
             kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+                load_in_4bit=True, bnb_4bit_compute_dtype=half)
             kwargs["device_map"] = {"": device}  # 4-bit models can't be .to()-moved
         elif device == "cuda":
-            kwargs["torch_dtype"] = torch.bfloat16
+            kwargs["torch_dtype"] = half
         base = AutoModelForCausalLM.from_pretrained(backbone, **kwargs)
         base.requires_grad_(False)  # backbone is always frozen; only LoRA trains
 
@@ -82,6 +85,12 @@ class LLMRec(nn.Module):
         self.model = get_peft_model(base, self.lora_cfg)
         if not load_4bit:
             self.model = self.model.to(device)
+        # keep LoRA weights in fp32 even under a half-precision backbone: fp16
+        # adapter training diverges without loss scaling, and peft casts the
+        # activations to the adapter dtype inside LoraLayer.forward anyway
+        for n, p in self.model.named_parameters():
+            if "lora_" in n:
+                p.data = p.data.float()
         self.device = device
         self.llm_dim = self.model.config.hidden_size
 

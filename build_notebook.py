@@ -60,6 +60,9 @@ if "google.colab" in sys.modules and not os.path.exists("config.py"):
     !git clone https://github.com/htainvn/qformer-rec.git repo_src
     %cd repo_src
     %pip -q install peft accelerate bitsandbytes
+    # Colab ships torchao 0.10, which recent peft rejects (needs >=0.16); we
+    # don't use torchao, so remove it rather than upgrade it
+    %pip -q uninstall -y torchao
     !unzip -o -q ml-1m.zip
     print("Colab setup done:", os.getcwd())""")
 
