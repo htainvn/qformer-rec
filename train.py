@@ -164,8 +164,16 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
     opt = torch.optim.AdamW(params, lr=lr)
     dl = make_loader(train_ds, cfg, batch_size, grouped=True, seed=cfg.seed)
     val_ds, val_users = _selection_val_set(cfg, val_ds)
+
+    # Loss scaling iff the frozen backbone is fp16 (T4/V100 fallback): backward
+    # crosses dozens of fp16 layers before reaching the fp32 LoRA/QFormer params
+    # and small grads underflow silently there. bf16 (A100+) has fp32's exponent
+    # range and needs no scaler; enabled=False makes every call a pass-through.
+    backbone_dt = llm.model.get_input_embeddings().weight.dtype
+    scaler = torch.amp.GradScaler("cuda", enabled=backbone_dt == torch.float16)
     print(f"[{tag}] {sum(p.numel() for p in params):,} trainable params, "
-          f"{len(val_users)} qualifying val users for selection")
+          f"{len(val_users)} qualifying val users for selection, "
+          f"backbone {backbone_dt}, grad scaler {'ON' if scaler.is_enabled() else 'off'}")
 
     selector = CheckpointSelector(sel_window=cfg.sel_window, top_k=cfg.top_k_soup,
                                   patience=cfg.patience, n_boot=cfg.n_boot, seed=cfg.seed)
@@ -195,13 +203,14 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
             loss, bce, pair = combined_loss(p, b.label, b.uid,
                                             lambda_pair=cfg.lambda_pair,
                                             margin=cfg.pair_margin)
-            (loss / grad_accum).backward()
+            scaler.scale(loss / grad_accum).backward()
             history["loss"].append(loss.item())
             history["bce"].append(bce.item()); history["pair"].append(pair.item())
             step += 1
             if step % grad_accum == 0:
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
-                opt.step(); opt.zero_grad()
+                scaler.step(opt); scaler.update(); opt.zero_grad()
             if step % cfg.log_every_steps == 0:
                 w = cfg.log_every_steps
                 rate = (step - step_last) / max(time.time() - t_last, 1e-9)
