@@ -147,8 +147,12 @@ def ndcg_at_k(uids, labels, scores, ks=(5, 10)) -> dict:
 
 @torch.no_grad()
 def score_dataset(llm, sasrec, qformer, dataset, batch_size=16, device="cpu",
-                  hybrid=True, progress=False):
-    """Run the full pipeline over a dataset; returns (uids, labels, scores)."""
+                  hybrid=True, progress=False, zero_soft_tokens=False):
+    """Run the full pipeline over a dataset; returns (uids, labels, scores).
+
+    zero_soft_tokens: keep the hybrid template but replace the QFormer outputs
+    with zeros — the ablation control for "does the LLM read the soft tokens
+    at all", scored on the identical prompts."""
     from torch.utils.data import DataLoader
     from data import collate
     llm.eval(); sasrec.eval(); qformer.eval()
@@ -160,6 +164,8 @@ def score_dataset(llm, sasrec, qformer, dataset, batch_size=16, device="cpu",
             H = sasrec.encode_history(b.his, b.his_mask)
             e_i = sasrec.item_embedding(b.iid)
             u_tok, i_tok = qformer(H, b.his_mask, e_i)
+            if zero_soft_tokens:
+                u_tok, i_tok = torch.zeros_like(u_tok), torch.zeros_like(i_tok)
             p = llm(b.his_titles, b.target_titles, u_tok, i_tok)
         else:
             p = llm(b.his_titles, b.target_titles)

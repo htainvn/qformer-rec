@@ -147,13 +147,20 @@ def _selection_val_set(cfg, val_ds):
 def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                     hybrid: bool, params: list, lr: float, epochs: int,
                     batch_size: int, grad_accum: int, tag: str,
-                    tracked_state_fn, llm_train: bool = True) -> tuple[CheckpointSelector, dict]:
+                    tracked_state_fn, llm_train: bool = True,
+                    mix_hybrid_template: bool = False) -> tuple[CheckpointSelector, dict]:
     """One training loop shared by Phases 1/2/2b — they differ only in which
     parameters train and whether soft tokens are injected.
 
     llm_train: whether the LLM runs in train mode. Phase 2 passes False — LoRA
     is frozen there, so its dropout would only inject noise into the QFormer's
-    gradients (and make train-time and eval-time forwards inconsistent)."""
+    gradients (and make train-time and eval-time forwards inconsistent).
+
+    mix_hybrid_template (Phase 1): alternate batches between the text-only
+    template and the HYBRID template with all-zero soft tokens. The LoRA then
+    learns both phrasings, so Phase 2 (whose zero-initialized bridge starts as
+    exactly this zero-token hybrid model) begins AT Phase-1 performance instead
+    of paying a template-shift penalty it must relearn."""
     opt = torch.optim.AdamW(params, lr=lr)
     dl = make_loader(train_ds, cfg, batch_size, grouped=True, seed=cfg.seed)
     val_ds, val_users = _selection_val_set(cfg, val_ds)
@@ -178,6 +185,11 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                 e_i = sasrec.item_embedding(b.iid)
                 u_tok, i_tok = qformer(H, b.his_mask, e_i)
                 p = llm(b.his_titles, b.target_titles, u_tok, i_tok)
+            elif mix_hybrid_template and step % 2 == 1:
+                B = len(b.target_titles)
+                u0 = torch.zeros(B, qformer.n_queries, llm.llm_dim, device=device)
+                i0 = torch.zeros(B, 1, llm.llm_dim, device=device)
+                p = llm(b.his_titles, b.target_titles, u0, i0)
             else:
                 p = llm(b.his_titles, b.target_titles)
             loss, bce, pair = combined_loss(p, b.label, b.uid,
@@ -233,7 +245,8 @@ def train_phase1(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         cfg, llm, sasrec, qformer, train_ds, val_ds, device,
         hybrid=False, params=params, lr=cfg.phase1_lr, epochs=cfg.phase1_epochs,
         batch_size=cfg.phase1_batch_size, grad_accum=cfg.phase1_grad_accum,
-        tag="phase1", tracked_state_fn=llm.lora_state_dict)
+        tag="phase1", tracked_state_fn=llm.lora_state_dict,
+        mix_hybrid_template=True)
 
     # Phase 1 selects a single best checkpoint (souping happens in Phase 2,
     # where the final model is assembled)
@@ -314,6 +327,23 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
     torch.save(soup, out / "qformer.pt")
     print(f"[phase2] saved souped QFormer -> {out / 'qformer.pt'}")
+
+    # Token-ablation diagnostic: same souped model, same prompts, soft tokens
+    # learned vs zeroed. Delta ~ 0 means the LLM is ignoring the bridge (the
+    # architecture-level failure Design 2 addresses); delta > 0 with flat val
+    # curves means the tokens carry signal the titles already had.
+    sel_ds, sel_users = _selection_val_set(cfg, val_ds)
+    u1, l1, s_learned = score_dataset(llm, sasrec, qformer, sel_ds,
+                                      batch_size=cfg.phase2_batch_size * 2,
+                                      device=device, hybrid=True)
+    _, _, s_zeroed = score_dataset(llm, sasrec, qformer, sel_ds,
+                                   batch_size=cfg.phase2_batch_size * 2,
+                                   device=device, hybrid=True, zero_soft_tokens=True)
+    au_l, uu_l = auc_fn(l1, s_learned), uauc_fn(u1, l1, s_learned, sel_users)
+    au_z, uu_z = auc_fn(l1, s_zeroed), uauc_fn(u1, l1, s_zeroed, sel_users)
+    print(f"[ablation] soft tokens learned: val AUC {au_l:.4f} UAUC {uu_l:.4f}")
+    print(f"[ablation] soft tokens zeroed : val AUC {au_z:.4f} UAUC {uu_z:.4f}")
+    print(f"[ablation] token contribution : dAUC {au_l - au_z:+.4f} dUAUC {uu_l - uu_z:+.4f}")
     return selector, history
 
 

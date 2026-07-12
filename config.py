@@ -65,7 +65,8 @@ class Config:
     phase1_grad_accum: int = 4
 
     # ---- Phase 2 (QFormer + projections on full prompt) ----------------------
-    phase2_lr: float = 5e-4
+    phase2_lr: float = 1e-3          # the 4.4M zero-init bridge learns through a
+                                     # frozen 7B; 5e-4 trained too slowly to trend
     phase2_epochs: int = 3
     phase2_batch_size: int = 8
     phase2_grad_accum: int = 4
@@ -81,7 +82,9 @@ class Config:
     # Per-epoch evals would be too coarse: 3 points can't feed any of them.
     log_every_steps: int = 50        # print running train loss every this many steps
     eval_every_steps: int = 500      # evaluate val AUC/UAUC every this many steps
-    sel_window: int = 3              # moving-average window for smoothed val UAUC
+    sel_window: int = 5              # moving-average window for smoothed val UAUC —
+                                     # val UAUC noise is ~±0.025 on ML-1M's 282
+                                     # qualifying users; window 3 under-smoothed
     top_k_soup: int = 3              # weight-average the top-k checkpoints (model soup)
     # patience is in EVALS: with eval_every_steps=200 and grad_accum=4 that is
     # only 50 optimizer updates per eval — 6 evals killed Phase 2 after ~300
