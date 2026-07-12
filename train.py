@@ -147,9 +147,13 @@ def _selection_val_set(cfg, val_ds):
 def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                     hybrid: bool, params: list, lr: float, epochs: int,
                     batch_size: int, grad_accum: int, tag: str,
-                    tracked_state_fn) -> tuple[CheckpointSelector, dict]:
+                    tracked_state_fn, llm_train: bool = True) -> tuple[CheckpointSelector, dict]:
     """One training loop shared by Phases 1/2/2b — they differ only in which
-    parameters train and whether soft tokens are injected."""
+    parameters train and whether soft tokens are injected.
+
+    llm_train: whether the LLM runs in train mode. Phase 2 passes False — LoRA
+    is frozen there, so its dropout would only inject noise into the QFormer's
+    gradients (and make train-time and eval-time forwards inconsistent)."""
     opt = torch.optim.AdamW(params, lr=lr)
     dl = make_loader(train_ds, cfg, batch_size, grouped=True, seed=cfg.seed)
     val_ds, val_users = _selection_val_set(cfg, val_ds)
@@ -164,7 +168,7 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
     for epoch in range(epochs):
         if stop:
             break
-        llm.train(); qformer.train()
+        llm.train(llm_train); qformer.train()
         sasrec.train(cfg.unfreeze_sasrec and hybrid)
         opt.zero_grad()
         for b in dl:
@@ -200,7 +204,7 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                                                    device, hybrid)
                 stop = selector.update(step, uids, labels, scores, val_users,
                                        tracked_state_fn())
-                llm.train(); qformer.train()
+                llm.train(llm_train); qformer.train()
                 sasrec.train(cfg.unfreeze_sasrec and hybrid)
                 t_last, step_last = time.time(), step  # don't count eval in step/s
                 if stop:
@@ -302,7 +306,7 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         hybrid=True, params=params, lr=cfg.phase2_lr, epochs=cfg.phase2_epochs,
         batch_size=cfg.phase2_batch_size, grad_accum=cfg.phase2_grad_accum,
         tag="phase2b" if cfg.unfreeze_sasrec else "phase2",
-        tracked_state_fn=tracked_state)
+        tracked_state_fn=tracked_state, llm_train=False)
 
     # final model = weight-average soup of the top-k checkpoints
     soup = selector.soup(cfg.top_k_soup)

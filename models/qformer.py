@@ -91,12 +91,25 @@ class QFormerBridge(nn.Module):
             QFormerLayer(hidden, n_heads, dropout) for _ in range(n_layers))
         self.final_norm = nn.LayerNorm(hidden)
 
-        # N query outputs -> N <UserID> soft tokens in LLM space
+        # N query outputs -> N <UserID> soft tokens in LLM space.
+        # Bottlenecked (hidden -> 512 -> llm_dim) instead of llm_dim wide: the
+        # collaborative signal is 64-d, a 4096x4096 layer only adds 17M params
+        # of overfit surface. ZERO-INIT on the output layer is load-bearing:
+        # default init emits tokens ~12x the norm of real LLM token embeddings,
+        # which wrecks the Phase-1-warmed prompt (val AUC drops ~0.71 -> 0.69)
+        # and Phase 2 spends its whole budget recovering. Zero-init makes the
+        # soft tokens an exact no-op at step 0, so Phase 2 STARTS at text-only
+        # performance and the collaborative signal is a pure add-on
+        # (ControlNet-style: the zeroed layer still receives gradient).
+        mid = max(8 * hidden, 512)
         self.user_proj = nn.Sequential(
-            nn.Linear(hidden, llm_dim), nn.GELU(), nn.Linear(llm_dim, llm_dim))
+            nn.Linear(hidden, mid), nn.GELU(), nn.Linear(mid, llm_dim))
         # separate MLP: raw target embedding e_i -> 1 <TargetItemID> soft token
         self.item_proj = nn.Sequential(
-            nn.Linear(emb_dim, llm_dim), nn.GELU(), nn.Linear(llm_dim, llm_dim))
+            nn.Linear(emb_dim, mid), nn.GELU(), nn.Linear(mid, llm_dim))
+        for proj in (self.user_proj, self.item_proj):
+            nn.init.zeros_(proj[-1].weight)
+            nn.init.zeros_(proj[-1].bias)
 
     def forward(self, H: torch.Tensor, his_mask: torch.Tensor, e_i: torch.Tensor):
         """H: [B, L, d] SASRec states; his_mask: [B, L] 1=real; e_i: [B, d].

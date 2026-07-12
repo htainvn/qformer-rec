@@ -77,7 +77,10 @@ class Config:
     eval_every_steps: int = 200      # evaluate val AUC/UAUC every this many steps
     sel_window: int = 3              # moving-average window for smoothed val UAUC
     top_k_soup: int = 3              # weight-average the top-k checkpoints (model soup)
-    patience: int = 6                # early stop after this many evals w/o smoothed-UAUC gain
+    # patience is in EVALS: with eval_every_steps=200 and grad_accum=4 that is
+    # only 50 optimizer updates per eval — 6 evals killed Phase 2 after ~300
+    # updates on the observed run, before the QFormer had learned anything
+    patience: int = 12               # early stop after this many evals w/o smoothed-UAUC gain
     n_boot: int = 1000               # bootstrap resamples (over users) for CIs
 
     # ---- evaluation -----------------------------------------------------------
