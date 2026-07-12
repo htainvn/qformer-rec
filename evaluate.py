@@ -141,6 +141,21 @@ def ndcg_at_k(uids, labels, scores, ks=(5, 10)) -> dict:
     return {k: float(np.mean(v)) for k, v in out.items()}
 
 
+def late_fusion(val_labels, val_text, val_cf, test_text, test_cf):
+    """Score-level fusion baseline: logistic blend of text-only LLM scores and
+    SASRec scores, fit on validation, applied to test.
+
+    This realizes the [headroom] ceiling as an actual model with zero training
+    risk, and is the baseline any learned bridge must beat to justify itself.
+    Returns blended test scores in [0, 1]."""
+    from sklearn.linear_model import LogisticRegression
+    lg = lambda x: np.log(np.clip(x, 1e-7, 1 - 1e-7) / (1 - np.clip(x, 1e-7, 1 - 1e-7)))
+    zv = np.stack([lg(val_text), lg(val_cf)], axis=1)
+    zt = np.stack([lg(test_text), lg(test_cf)], axis=1)
+    model = LogisticRegression().fit(zv, val_labels)
+    return model.predict_proba(zt)[:, 1]
+
+
 # --------------------------------------------------------------------------- #
 # Scoring a model over a dataset
 # --------------------------------------------------------------------------- #

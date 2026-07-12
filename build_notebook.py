@@ -313,6 +313,31 @@ verdict = ("BEATS baseline (CI excludes 0)" if paired["ci"][0] > 0 else
            "does NOT significantly beat baseline" if paired["ci"][1] > 0 else
            "significantly WORSE than baseline")
 print("→", verdict)""")
+md("""### Late-fusion baseline
+
+Logistic blend of the text-only LLM scores and SASRec scores (2 parameters, fit on val,
+applied to test). This realizes the `[headroom]` ceiling with zero training risk and is
+the honest baseline the QFormer bridge must beat: if the bridge can't out-rank a 2-param
+score blend, the injection mechanism — not the signal — is the bottleneck.""")
+code("""from evaluate import late_fusion
+from train import _selection_val_set
+
+sel_ds, _ = _selection_val_set(cfg, val_ds)
+uv, lv, v_text = score_dataset(llm, sasrec, qformer, sel_ds,
+                               batch_size=cfg.phase2_batch_size * 2, device=DEVICE, hybrid=False)
+_, _, t_text = score_dataset(llm, sasrec, qformer, test_ds,
+                             batch_size=cfg.phase2_batch_size * 2, device=DEVICE, hybrid=False)
+with torch.no_grad():
+    dlv = DataLoader(sel_ds, batch_size=256, shuffle=False, collate_fn=collate)
+    v_cf = np.concatenate([
+        torch.sigmoid(sasrec.ctr_logit(b.his.to(DEVICE), b.his_mask.to(DEVICE),
+                                       b.iid.to(DEVICE))).float().cpu().numpy() for b in dlv])
+
+fusion = late_fusion(lv, v_text, v_cf, t_text, sasrec_scores)
+bridge = seed_scores[SEEDS[0]][2]
+for name, s in [("text-only LLM", t_text), ("late fusion", fusion), ("QFormer bridge", bridge)]:
+    print(f"{name:15s}: test AUC {auc_fn(labels_t, s):.4f} "
+          f"UAUC {uauc_fn(uids_t, labels_t, s, TEST_USERS):.4f}")""")
 code("""print(comparison_table(auc_mean, auc_std, uauc_mean, uauc_std, uauc_ci, len(SEEDS)))
 
 mean_scores = np.mean([seed_scores[s][2] for s in SEEDS], axis=0)
