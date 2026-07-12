@@ -163,6 +163,10 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
     exactly this zero-token hybrid model) begins AT Phase-1 performance instead
     of paying a template-shift penalty it must relearn."""
     eval_every = eval_every or cfg.eval_every_steps
+    # params may be a flat list or AdamW param-group dicts (Phase 2b runs the
+    # bridge and SASRec at different learning rates)
+    flat_params = ([p for g in params for p in g["params"]]
+                   if params and isinstance(params[0], dict) else params)
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     dl = make_loader(train_ds, cfg, batch_size, grouped=True, seed=cfg.seed)
     val_ds, val_users = _selection_val_set(cfg, val_ds)
@@ -173,7 +177,7 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
     # range and needs no scaler; enabled=False makes every call a pass-through.
     backbone_dt = llm.model.get_input_embeddings().weight.dtype
     scaler = torch.amp.GradScaler("cuda", enabled=backbone_dt == torch.float16)
-    print(f"[{tag}] {sum(p.numel() for p in params):,} trainable params, "
+    print(f"[{tag}] {sum(p.numel() for p in flat_params):,} trainable params, "
           f"{len(val_users)} qualifying val users for selection, "
           f"backbone {backbone_dt}, grad scaler {'ON' if scaler.is_enabled() else 'off'}")
 
@@ -211,7 +215,7 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
             step += 1
             if step % grad_accum == 0:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                torch.nn.utils.clip_grad_norm_(flat_params, 1.0)
                 scaler.step(opt); scaler.update(); opt.zero_grad()
             if step % cfg.log_every_steps == 0:
                 w = cfg.log_every_steps
@@ -362,7 +366,9 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
     sasrec.requires_grad_(cfg.unfreeze_sasrec)
     params = list(qformer.parameters())
     if cfg.unfreeze_sasrec:
-        params += [p for p in sasrec.parameters() if p.requires_grad]
+        params = [{"params": params, "lr": cfg.phase2_lr},
+                  {"params": [p for p in sasrec.parameters() if p.requires_grad],
+                   "lr": cfg.sasrec_lr_2b}]
 
     def tracked_state():
         # track everything the soup must average: QFormer (+SASRec in 2b)

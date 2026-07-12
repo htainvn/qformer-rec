@@ -80,6 +80,8 @@ class Config:
     phase2_batch_size: int = 8
     phase2_grad_accum: int = 4
     unfreeze_sasrec: bool = False    # Phase 2b: also fine-tune SASRec
+    sasrec_lr_2b: float = 1e-4       # 2b: SASRec fine-tunes 5x slower than the
+                                     # bridge so it adapts, not forgets, Phase 0
     users_per_batch: int = 4         # group sampler: users per batch (so same-user pairs exist)
 
     # ---- checkpoint selection ------------------------------------------------
