@@ -9,3 +9,4 @@ checkpoints/
 
 # extracted data (ml-1m.zip is committed; data.py reads ml-1m/*.pkl after unzip)
 ml-1m/
+run/
