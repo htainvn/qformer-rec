@@ -235,14 +235,20 @@ class UserGroupedBatchSampler(Sampler):
 def load_data(cfg):
     """Entry point: returns (train_ds, val_ds, test_ds, n_users, n_items, id2title)."""
     if cfg.smoke_test:
+        # synthetic data is a SMOKE-ONLY convenience; a full run must never
+        # silently produce metrics on toy data (they'd be indistinguishable
+        # from real numbers in the logs)
         tr, va, te, n_users, n_items, id2title = make_synthetic(seed=cfg.seed)
     else:
         data_dir = Path(cfg.data_dir)
-        if not (data_dir / "train_ood2.pkl").exists():
-            print(f"[data] {data_dir}/train_ood2.pkl not found -> falling back to synthetic data")
-            tr, va, te, n_users, n_items, id2title = make_synthetic(seed=cfg.seed)
-        else:
-            tr, va, te, n_users, n_items, id2title = load_collm_ml1m(data_dir)
+        missing = [f for f in ("train_ood2.pkl", "valid_ood2.pkl", "test_ood2.pkl")
+                   if not (data_dir / f).exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"CoLLM ML-1M pickles missing from '{data_dir}/': {missing}. "
+                f"Unzip ml-1m.zip (or fix cfg.data_dir). Synthetic data is only "
+                f"used when cfg.smoke_test=True — refusing to fall back silently.")
+        tr, va, te, n_users, n_items, id2title = load_collm_ml1m(data_dir)
     mk = lambda df: RecDataset(df, id2title, max_his=cfg.max_his_len,
                                prompt_titles=cfg.prompt_titles)
     return mk(tr), mk(va), mk(te), n_users, n_items, id2title
