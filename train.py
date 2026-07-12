@@ -148,7 +148,8 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                     hybrid: bool, params: list, lr: float, epochs: int,
                     batch_size: int, grad_accum: int, tag: str,
                     tracked_state_fn, llm_train: bool = True,
-                    mix_hybrid_template: bool = False) -> tuple[CheckpointSelector, dict]:
+                    mix_hybrid_template: bool = False, weight_decay: float = 0.01,
+                    eval_every: int | None = None) -> tuple[CheckpointSelector, dict]:
     """One training loop shared by Phases 1/2/2b — they differ only in which
     parameters train and whether soft tokens are injected.
 
@@ -161,7 +162,8 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
     learns both phrasings, so Phase 2 (whose zero-initialized bridge starts as
     exactly this zero-token hybrid model) begins AT Phase-1 performance instead
     of paying a template-shift penalty it must relearn."""
-    opt = torch.optim.AdamW(params, lr=lr)
+    eval_every = eval_every or cfg.eval_every_steps
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     dl = make_loader(train_ds, cfg, batch_size, grouped=True, seed=cfg.seed)
     val_ds, val_users = _selection_val_set(cfg, val_ds)
 
@@ -220,7 +222,7 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                       f"(bce {np.mean(history['bce'][-w:]):.4f} "
                       f"pair {np.mean(history['pair'][-w:]):.4f}) "
                       f"{rate:.2f} step/s", flush=True)
-            if step % cfg.eval_every_steps == 0:
+            if step % eval_every == 0:
                 uids, labels, scores = _val_scores(cfg, llm, sasrec, qformer, val_ds,
                                                    device, hybrid)
                 stop = selector.update(step, uids, labels, scores, val_users,
@@ -374,7 +376,9 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         hybrid=True, params=params, lr=cfg.phase2_lr, epochs=cfg.phase2_epochs,
         batch_size=cfg.phase2_batch_size, grad_accum=cfg.phase2_grad_accum,
         tag="phase2b" if cfg.unfreeze_sasrec else "phase2",
-        tracked_state_fn=tracked_state, llm_train=False)
+        tracked_state_fn=tracked_state, llm_train=False,
+        weight_decay=cfg.phase2_weight_decay,
+        eval_every=cfg.phase2_eval_every_steps)
 
     # final model = weight-average soup of the top-k checkpoints
     soup = selector.soup(cfg.top_k_soup)
@@ -399,6 +403,11 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
     print(f"[ablation] soft tokens learned: val AUC {au_l:.4f} UAUC {uu_l:.4f}")
     print(f"[ablation] soft tokens zeroed : val AUC {au_z:.4f} UAUC {uu_z:.4f}")
     print(f"[ablation] token contribution : dAUC {au_l - au_z:+.4f} dUAUC {uu_l - uu_z:+.4f}")
+    if uu_l < uu_z:
+        print("[ablation] WARNING: the souped tokens UNDERPERFORM zeroed tokens on "
+              "val UAUC — the soup averaged in overfit checkpoints. Prefer the "
+              "earliest high checkpoints (see [select] trace) and/or regularize "
+              "the bridge harder before trusting this model.", flush=True)
     return selector, history
 
 

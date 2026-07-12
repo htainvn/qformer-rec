@@ -40,7 +40,8 @@ class Config:
     n_queries: int = 4               # N learnable queries -> N <UserID> soft tokens
     qformer_layers: int = 2
     qformer_heads: int = 4
-    qformer_dropout: float = 0.1
+    qformer_dropout: float = 0.2     # the 4.4M bridge memorizes 839 train users
+                                     # within ~1k steps; regularize hard
     target_aware: bool = True        # FiLM-condition queries on target item embedding
     qformer_align_pretrain: bool = False  # optional contrastive alignment before Phase 2
     align_epochs: int = 3
@@ -69,8 +70,12 @@ class Config:
     phase1_grad_accum: int = 4
 
     # ---- Phase 2 (QFormer + projections on full prompt) ----------------------
-    phase2_lr: float = 1e-3          # the 4.4M zero-init bridge learns through a
-                                     # frozen 7B; 5e-4 trained too slowly to trend
+    # Observed on the full run: lr 1e-3 reached +1.3 val AUC over the zero-token
+    # reference by step 500, then declined monotonically (bridge overfit). Slow
+    # it down, regularize, and sample the early peak densely.
+    phase2_lr: float = 5e-4
+    phase2_weight_decay: float = 0.05
+    phase2_eval_every_steps: int = 250   # phase 2's peak is early and narrow
     phase2_epochs: int = 3
     phase2_batch_size: int = 8
     phase2_grad_accum: int = 4
@@ -142,6 +147,7 @@ class Config:
             phase2_grad_accum=1,
             log_every_steps=10,
             eval_every_steps=20,
+            phase2_eval_every_steps=20,
             sel_window=2,
             top_k_soup=2,
             patience=4,
