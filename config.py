@@ -73,8 +73,14 @@ class Config:
     users_per_batch: int = 4         # group sampler: users per batch (so same-user pairs exist)
 
     # ---- checkpoint selection ------------------------------------------------
+    # Eval cadence is a wall-clock lever at 7B scale: at eval_every=200 with the
+    # full 10.4k-row val split, evaluation was ~85% of Phase-1/2 runtime (10.4k
+    # eval forwards after every 1.6k training samples). 500 steps x a 300-user
+    # val subsample keeps ~25 selection points over 3 epochs (plenty for the
+    # smoothing window, top-k soup, and patience) at ~1/3 of the wall-clock.
+    # Per-epoch evals would be too coarse: 3 points can't feed any of them.
     log_every_steps: int = 50        # print running train loss every this many steps
-    eval_every_steps: int = 200      # evaluate val AUC/UAUC every this many steps
+    eval_every_steps: int = 500      # evaluate val AUC/UAUC every this many steps
     sel_window: int = 3              # moving-average window for smoothed val UAUC
     top_k_soup: int = 3              # weight-average the top-k checkpoints (model soup)
     # patience is in EVALS: with eval_every_steps=200 and grad_accum=4 that is
@@ -92,7 +98,8 @@ class Config:
     out_dir: str = "checkpoints"
     device: str = ""                 # "" = auto-detect (cuda > mps > cpu)
     num_workers: int = 0
-    val_subsample_users: int = 0     # 0 = full val; >0 = cap users per eval step for speed
+    val_subsample_users: int = 300   # selection evals score this fixed user subset
+                                     # (0 = full val); test evaluation is never subsampled
 
     def resolve_device(self) -> str:
         if self.device:

@@ -101,8 +101,8 @@ LoRA(r=8, α=16 on q_proj/v_proj), 3 seeds, model soup of top-3 checkpoints. Exp
 hours per seed on a single A100 (use `load_4bit=True` to fit smaller GPUs).""")
 code("""# cfg = Config()                       # full ML-1M + Vicuna-7B
 # cfg.n_seeds = 3                        # 3-5 seeds for the reported mean ± std
-# cfg.val_subsample_users = 300          # cap per-eval cost: fixed user subset for
-#                                        # checkpoint SELECTION only (test = full split)
+# # selection evals: every 500 steps on a fixed 300-user val subset (defaults);
+# # cfg.val_subsample_users = 0 scores the full val split if you want it
 # # cfg.load_4bit = True                 # QLoRA-quantize the frozen backbone if VRAM-bound
 # # cfg.unfreeze_sasrec = True           # Phase 2b variant
 # # cfg.qformer_align_pretrain = True    # optional contrastive QFormer init
