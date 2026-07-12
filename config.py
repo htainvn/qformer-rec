@@ -43,6 +43,12 @@ class Config:
     qformer_dropout: float = 0.2     # the 4.4M bridge memorizes 839 train users
                                      # within ~1k steps; regularize hard
     target_aware: bool = True        # FiLM-condition queries on target item embedding
+    # Design 2 (models/README.md): pre-train a DIN encoder alongside SASRec and
+    # feed the QFormer fused keys/values concat([H_sasrec, D_din]) of width
+    # 2*emb_dim, with target-agnostic queries (the target already lives inside
+    # DIN's per-position weighting). The escalation path when Design 1's UAUC
+    # plateaus — which it did, at ~0.695 val.
+    design2: bool = False
     qformer_align_pretrain: bool = False  # optional contrastive alignment before Phase 2
     align_epochs: int = 3
     align_lr: float = 1e-3

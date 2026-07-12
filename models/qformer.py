@@ -48,12 +48,18 @@ class FiLM(nn.Module):
 
 
 class QFormerLayer(nn.Module):
-    """One block = self-attention over queries + cross-attention (queries -> H) + FFN."""
+    """One block = self-attention over queries + cross-attention (queries -> H) + FFN.
 
-    def __init__(self, hidden_dim: int, n_heads: int, dropout: float):
+    kv_dim: dimensionality of the cross-attention keys/values when it differs
+    from the query width — Design 2 feeds fused [H_sasrec ; D_din] states of
+    width 2*emb_dim."""
+
+    def __init__(self, hidden_dim: int, n_heads: int, dropout: float,
+                 kv_dim: int | None = None):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
-        self.cross_attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True,
+                                                kdim=kv_dim, vdim=kv_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4), nn.GELU(),
             nn.Dropout(dropout), nn.Linear(hidden_dim * 4, hidden_dim),
@@ -77,7 +83,7 @@ class QFormerLayer(nn.Module):
 class QFormerBridge(nn.Module):
     def __init__(self, emb_dim: int = 64, llm_dim: int = 4096, n_queries: int = 4,
                  n_layers: int = 2, n_heads: int = 4, dropout: float = 0.1,
-                 target_aware: bool = True):
+                 target_aware: bool = True, kv_dim: int | None = None):
         super().__init__()
         self.target_aware = target_aware
         self.n_queries = n_queries
@@ -88,7 +94,7 @@ class QFormerBridge(nn.Module):
 
         self.film = FiLM(emb_dim, hidden) if target_aware else None
         self.layers = nn.ModuleList(
-            QFormerLayer(hidden, n_heads, dropout) for _ in range(n_layers))
+            QFormerLayer(hidden, n_heads, dropout, kv_dim=kv_dim) for _ in range(n_layers))
         self.final_norm = nn.LayerNorm(hidden)
 
         # N query outputs -> N <UserID> soft tokens in LLM space.

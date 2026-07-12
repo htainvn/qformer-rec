@@ -28,10 +28,19 @@ target id ──> e_i ──> FiLM(γ, β) ──> Q' = γ(e_i)·Q + β(e_i)
   late (title + projected item token in the prompt). Early shapes *what is read
   out of the history*; late lets the LLM do the final semantic matching.
 
-## Design 2 (documented only — NOT implemented): DIN-fused values
+## Design 2 (implemented — `cfg.design2=True`): DIN-fused values
 
-A fallback with a higher ceiling (and higher cost) if Design 1 plateaus below
-the UAUC target.
+The fallback for Design 1 plateauing below the UAUC target — which happened at
+~0.695 val UAUC. Now implemented: `models/din.py` (DINEncoder + FusedEncoder),
+`train_phase0_din`, and `kv_dim` support in the QFormer.
+
+**Measured go/no-go on real ML-1M (val, UAUC-selected):** DIN standalone
+0.6766 UAUC vs SASRec 0.6763 — identical within noise — and their score blend
+is WORSE (0.6744) on UAUC while better (+1.4pts) on AUC. The two encoders'
+within-user signals are the same signal; ML-1M's 34k interactions appear to
+saturate at ~0.68 collaborative UAUC. Design 2 is therefore NOT expected to
+lift UAUC on this dataset; it remains useful on datasets with richer
+per-user interaction data.
 
 Keep SASRec **and** add a DIN encoder (Deep Interest Network). DIN computes
 target-aware attention weights over history items; instead of using its pooled

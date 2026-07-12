@@ -35,6 +35,7 @@ from config import Config
 from data import load_data, collate, UserGroupedBatchSampler
 from losses import combined_loss, bce_loss
 from models import SASRec, QFormerBridge, LLMRec
+from models.din import DINEncoder, FusedEncoder
 from selection import CheckpointSelector
 from evaluate import qualifying_users, score_dataset, auc as auc_fn, uauc as uauc_fn
 
@@ -68,7 +69,10 @@ def train_phase0(cfg: Config, train_ds, val_ds, n_items, device) -> tuple[SASRec
     dl = make_loader(train_ds, cfg, cfg.phase0_batch_size, grouped=False, seed=cfg.seed)
 
     history = {"loss": [], "val_auc": [], "val_uauc": []}
-    best_auc, best_state, stale = -1.0, None, 0
+    # select on val UAUC — the project's primary metric. Selecting on AUC (the
+    # old behavior) picked a checkpoint whose UAUC was 1.7pts lower (0.6596 vs
+    # 0.6763 on the real data), directly capping the fusion/bridge ceiling.
+    best_uauc, best_state, stale = -1.0, None, 0
     for epoch in range(cfg.phase0_epochs):
         sasrec.train()
         losses = []
@@ -84,20 +88,20 @@ def train_phase0(cfg: Config, train_ds, val_ds, n_items, device) -> tuple[SASRec
         history["val_auc"].append(v_auc); history["val_uauc"].append(v_uauc)
         print(f"[phase0] epoch {epoch + 1}/{cfg.phase0_epochs} "
               f"loss {history['loss'][-1]:.4f} val AUC {v_auc:.4f} val UAUC {v_uauc:.4f}")
-        if v_auc > best_auc:
-            best_auc, stale = v_auc, 0
+        if v_uauc > best_uauc:
+            best_uauc, stale = v_uauc, 0
             best_state = {k: v.detach().cpu().clone() for k, v in sasrec.state_dict().items()}
         else:
             stale += 1
             if stale >= cfg.phase0_patience:   # SASRec overfits fast on 34k rows;
                 print(f"[phase0] early stop at epoch {epoch + 1} "
-                      f"(no val-AUC gain for {stale} epochs)")
+                      f"(no val-UAUC gain for {stale} epochs)")
                 break
 
     sasrec.load_state_dict(best_state)
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
     torch.save(best_state, out / "sasrec.pt")
-    print(f"[phase0] saved best (val AUC {best_auc:.4f}) -> {out / 'sasrec.pt'}")
+    print(f"[phase0] saved best (val UAUC {best_uauc:.4f}) -> {out / 'sasrec.pt'}")
     return sasrec, history
 
 
@@ -113,6 +117,44 @@ def eval_sasrec(sasrec, ds, device, batch_size=512):
         scores.append(s.cpu().numpy())
     uids, labels, scores = map(np.concatenate, (uids, labels, scores))
     return auc_fn(labels, scores), uauc_fn(uids, labels, scores)
+
+
+def train_phase0_din(cfg: Config, train_ds, val_ds, n_items, device):
+    """Design 2: pre-train the DIN encoder with the same CTR objective.
+    Selected by val UAUC — DIN's whole purpose here is within-user signal."""
+    din = DINEncoder(n_items, cfg.emb_dim, dropout=cfg.sasrec_dropout).to(device)
+    opt = torch.optim.AdamW(din.parameters(), lr=cfg.phase0_lr,
+                            weight_decay=cfg.phase0_weight_decay)
+    dl = make_loader(train_ds, cfg, cfg.phase0_batch_size, grouped=False, seed=cfg.seed)
+    history = {"loss": [], "val_auc": [], "val_uauc": []}
+    best_uauc, best_state, stale = -1.0, None, 0
+    for epoch in range(cfg.phase0_epochs):
+        din.train()
+        losses = []
+        for b in dl:
+            b = b.to(device)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                din.ctr_logit(b.his, b.his_mask, b.iid), b.label)
+            opt.zero_grad(); loss.backward(); opt.step()
+            losses.append(loss.item())
+        v_auc, v_uauc = eval_sasrec(din, val_ds, device)   # works on any ctr_logit model
+        history["loss"].append(float(np.mean(losses)))
+        history["val_auc"].append(v_auc); history["val_uauc"].append(v_uauc)
+        print(f"[phase0-din] epoch {epoch + 1}/{cfg.phase0_epochs} "
+              f"loss {history['loss'][-1]:.4f} val AUC {v_auc:.4f} val UAUC {v_uauc:.4f}")
+        if v_uauc > best_uauc:
+            best_uauc, stale = v_uauc, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in din.state_dict().items()}
+        else:
+            stale += 1
+            if stale >= cfg.phase0_patience:
+                print(f"[phase0-din] early stop at epoch {epoch + 1}")
+                break
+    din.load_state_dict(best_state)
+    out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
+    torch.save(best_state, out / "din.pt")
+    print(f"[phase0-din] saved best (val UAUC {best_uauc:.4f}) -> {out / 'din.pt'}")
+    return din, history
 
 
 # --------------------------------------------------------------------------- #
@@ -195,7 +237,9 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
         for b in dl:
             b = b.to(device)
             if hybrid:
-                H = sasrec.encode_history(b.his, b.his_mask)
+                H = (sasrec.encode_history_target(b.his, b.his_mask, b.iid)
+                     if hasattr(sasrec, "encode_history_target")   # Design 2
+                     else sasrec.encode_history(b.his, b.his_mask))
                 e_i = sasrec.item_embedding(b.iid)
                 u_tok, i_tok = qformer(H, b.his_mask, e_i)
                 p = llm(b.his_titles, b.target_titles, u_tok, i_tok)
@@ -434,9 +478,13 @@ def build_models(cfg: Config, n_items: int, device: str):
                  cfg.lora_targets, cfg.load_4bit, device)
     sasrec = SASRec(n_items, cfg.emb_dim, cfg.max_his_len, cfg.sasrec_blocks,
                     cfg.sasrec_heads, cfg.sasrec_dropout).to(device)
+    # Design 2: fused [H_sasrec ; D_din] keys/values, target-agnostic queries
+    # (the target already weights DIN's values); Design 1: FiLM per config.
     qformer = QFormerBridge(cfg.emb_dim, llm.llm_dim, cfg.n_queries,
                             cfg.qformer_layers, cfg.qformer_heads,
-                            cfg.qformer_dropout, cfg.target_aware).to(device)
+                            cfg.qformer_dropout,
+                            target_aware=cfg.target_aware and not cfg.design2,
+                            kv_dim=2 * cfg.emb_dim if cfg.design2 else None).to(device)
     return llm, sasrec, qformer
 
 
@@ -451,6 +499,9 @@ def run_all_phases(cfg: Config, seed: int | None = None):
 
     # Phase 0
     sasrec, hist0 = train_phase0(cfg, train_ds, val_ds, n_items, device)
+    if cfg.design2:
+        din, hist0d = train_phase0_din(cfg, train_ds, val_ds, n_items, device)
+        sasrec = FusedEncoder(sasrec, din)     # drop-in for the `sasrec` slot
 
     # LLM + QFormer
     llm, _, qformer = build_models(cfg, n_items, device)
@@ -460,7 +511,10 @@ def run_all_phases(cfg: Config, seed: int | None = None):
     sel1, hist1 = train_phase1(cfg, llm, sasrec, qformer, train_ds, val_ds, device)
 
     # Optional alignment pre-training for the QFormer
-    if cfg.qformer_align_pretrain:
+    if cfg.qformer_align_pretrain and cfg.design2:
+        print("[align] skipped: align_scores assumes plain SASRec states, "
+              "not Design-2 fused KV")
+    elif cfg.qformer_align_pretrain:
         align_pretrain_qformer(cfg, sasrec, qformer, train_ds, device)
 
     # Phase 2 (or 2b when cfg.unfreeze_sasrec)

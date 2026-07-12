@@ -176,7 +176,9 @@ def score_dataset(llm, sasrec, qformer, dataset, batch_size=16, device="cpu",
     for i, b in enumerate(dl):
         b = b.to(device)
         if hybrid:
-            H = sasrec.encode_history(b.his, b.his_mask)
+            H = (sasrec.encode_history_target(b.his, b.his_mask, b.iid)
+                 if hasattr(sasrec, "encode_history_target")   # Design 2: fused KV
+                 else sasrec.encode_history(b.his, b.his_mask))
             e_i = sasrec.item_embedding(b.iid)
             u_tok, i_tok = qformer(H, b.his_mask, e_i)
             if zero_soft_tokens:
