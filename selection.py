@@ -106,18 +106,46 @@ class CheckpointSelector:
         print(f"[select] noise band ±{band:.4f}: {len(in_band)} checkpoint(s) tied at top")
         return in_band + out_band
 
+    @staticmethod
+    def _avg(states: list[dict]) -> dict:
+        avg = {}
+        for key in states[0].keys():
+            avg[key] = (sum(s[key].float() for s in states) / len(states)
+                        ).to(states[0][key].dtype)  # keep bf16 LoRA dtype
+        return avg
+
     def soup(self, k: int | None = None) -> dict:
         """Weight-average (uniform soup) of the top-k checkpoints' states."""
         k = k or self.top_k
         top = self.rank()[:k]
         print(f"[select] souping {len(top)} checkpoints from steps {[p.step for p in top]}")
-        keys = top[0].state.keys()
-        avg = {}
-        for key in keys:
-            avg[key] = sum(p.state[key].float() for p in top) / len(top)
-            # preserve original dtype (LoRA weights may be bf16 on GPU)
-            avg[key] = avg[key].to(top[0].state[key].dtype)
-        return avg
+        return self._avg([p.state for p in top])
+
+    def greedy_soup(self, eval_fn, k: int | None = None) -> dict:
+        """Wortsman-style greedy soup: start from the best checkpoint and add
+        the next-ranked candidate ONLY if the averaged weights improve val UAUC
+        (eval_fn: state_dict -> val UAUC). Uniform averaging assumes the
+        checkpoints share a linearly-connected basin — false for a from-scratch
+        bridge whose distant checkpoints implement different attention
+        solutions, where blind averaging interferes destructively. Greedy
+        verification makes the soup provably no worse than the best single
+        checkpoint, at the cost of a few extra val passes."""
+        k = k or self.top_k
+        cands = self.rank()[:k + 2]              # a couple of spares to try
+        members = [cands[0].state]
+        best_u = eval_fn(cands[0].state)
+        print(f"[soup] base = step {cands[0].step}: val UAUC {best_u:.4f}")
+        for p in cands[1:]:
+            if len(members) >= k:
+                break
+            trial = self._avg(members + [p.state])
+            u = eval_fn(trial)
+            keep = u > best_u
+            print(f"[soup] + step {p.step}: val UAUC {u:.4f} ({'kept' if keep else 'rejected'})")
+            if keep:
+                members.append(p.state)
+                best_u = u
+        return self._avg(members) if len(members) > 1 else members[0]
 
     def best_state(self) -> dict:
         return copy.deepcopy(self.rank()[0].state)

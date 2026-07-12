@@ -430,8 +430,18 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         weight_decay=cfg.phase2_weight_decay,
         eval_every=cfg.phase2_eval_every_steps)
 
-    # final model = weight-average soup of the top-k checkpoints
-    soup = selector.soup(cfg.top_k_soup)
+    # final model = GREEDY soup: candidates join only if they improve val UAUC
+    sel_ds, sel_users = _selection_val_set(cfg, val_ds)
+
+    def _soup_eval(state):
+        load_tracked_state(state, qformer, sasrec if cfg.unfreeze_sasrec else None)
+        u, l, s = score_dataset(llm, sasrec, qformer, sel_ds,
+                                batch_size=cfg.phase2_batch_size * 2,
+                                device=device, hybrid=True)
+        from evaluate import uauc as _uauc
+        return _uauc(u, l, s, sel_users)
+
+    soup = selector.greedy_soup(_soup_eval, cfg.top_k_soup)
     load_tracked_state(soup, qformer, sasrec if cfg.unfreeze_sasrec else None)
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
     torch.save(soup, out / "qformer.pt")
