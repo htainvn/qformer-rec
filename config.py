@@ -59,8 +59,12 @@ class Config:
     pair_margin: float = 0.0         # 0.0 -> plain BPR softplus; >0 -> margin hinge
 
     # ---- Phase 1 (LoRA warm-up, text-only prompt) ---------------------------
+    # epochs are an UPPER BOUND — patience early-stopping on smoothed val UAUC
+    # is the real terminator. The observed 1-epoch run ended with the val curve
+    # still rising (UAUC 0.6887->peak 0.6916, AUC still climbing), i.e. the
+    # epoch limit cut training short, not the data.
     phase1_lr: float = 1e-4
-    phase1_epochs: int = 1
+    phase1_epochs: int = 3
     phase1_batch_size: int = 8
     phase1_grad_accum: int = 4
 
