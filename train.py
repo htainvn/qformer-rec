@@ -264,7 +264,53 @@ def train_phase1(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
     torch.save(best, out / "lora_phase1.pt")
     print(f"[phase1] saved LoRA -> {out / 'lora_phase1.pt'}")
+    headroom_diagnostic(cfg, llm, sasrec, qformer, val_ds, device)
     return selector, history
+
+
+def headroom_diagnostic(cfg, llm, sasrec, qformer, val_ds, device):
+    """Upper-bounds what Phase 2 can add BEFORE training it.
+
+    Optimally blends the text-only LLM scores with SASRec's CTR scores (a
+    2-parameter logistic fit on half the val users, evaluated on the held-out
+    half). The blend's lift over text-only is the ceiling for ANY mechanism
+    that injects SASRec-grade signal into the frozen LLM — if it is ~0, the
+    collaborative signal is redundant with the titles and a flat Phase 2 is
+    expected (the fix is a stronger collaborative model, not bridge tuning).
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    sel_ds, sel_users = _selection_val_set(cfg, val_ds)
+    u, l, s_text = score_dataset(llm, sasrec, qformer, sel_ds,
+                                 batch_size=cfg.phase2_batch_size * 2,
+                                 device=device, hybrid=False)
+    sasrec.eval()
+    dl = DataLoader(sel_ds, batch_size=512, shuffle=False, collate_fn=collate)
+    with torch.no_grad():
+        s_cf = np.concatenate([
+            torch.sigmoid(sasrec.ctr_logit(b.his.to(device), b.his_mask.to(device),
+                                           b.iid.to(device))).float().cpu().numpy()
+            for b in dl])
+
+    logit = lambda x: np.log(np.clip(x, 1e-7, 1 - 1e-7) / (1 - np.clip(x, 1e-7, 1 - 1e-7)))
+    z = np.stack([logit(s_text), logit(s_cf)], axis=1)
+    rng = np.random.default_rng(cfg.seed)
+    half_a = rng.choice(sel_users, size=len(sel_users) // 2, replace=False)
+    in_a = np.isin(u, half_a)
+    users_b = np.asarray([x for x in sel_users if x not in set(half_a.tolist())])
+
+    lr_model = LogisticRegression().fit(z[in_a], l[in_a])
+    s_blend = lr_model.predict_proba(z[~in_a])[:, 1]
+    ub, lb = u[~in_a], l[~in_a]
+    a_t, uu_t = auc_fn(lb, s_text[~in_a]), uauc_fn(ub, lb, s_text[~in_a], users_b)
+    a_b, uu_b = auc_fn(lb, s_blend), uauc_fn(ub, lb, s_blend, users_b)
+    a_c, uu_c = auc_fn(lb, s_cf[~in_a]), uauc_fn(ub, lb, s_cf[~in_a], users_b)
+    print(f"[headroom] held-out half ({len(users_b)} users):")
+    print(f"[headroom]   text-only LLM : AUC {a_t:.4f} UAUC {uu_t:.4f}")
+    print(f"[headroom]   SASRec alone  : AUC {a_c:.4f} UAUC {uu_c:.4f}")
+    print(f"[headroom]   optimal blend : AUC {a_b:.4f} UAUC {uu_b:.4f}")
+    print(f"[headroom]   Phase-2 ceiling (blend - text): dAUC {a_b - a_t:+.4f} "
+          f"dUAUC {uu_b - uu_t:+.4f}  <- if ~0, a flat Phase 2 is EXPECTED", flush=True)
 
 
 # --------------------------------------------------------------------------- #
