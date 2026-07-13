@@ -9,11 +9,15 @@
              only the QFormer + projection heads train. SASRec frozen (Phase 0).
              -> qformer.pt (soup)
   Phase 2b — Phase 2 with `unfreeze_sasrec=True`: SASRec fine-tunes jointly.
+  Phase 3  — (optional, `phase3_joint_finetune`) unfreeze LoRA + QFormer TOGETHER
+             from their trained inits at a low lr, so the reader learns to
+             decode the informative tokens it never saw during Phase 1.
 
-  We deliberately do NOT offer a joint one-step LoRA+QFormer path: per CoLLM's
-  ablations it underperforms, especially on cold users — the LoRA gradient
-  dominates early and the mapping module never learns to carry collaborative
-  information.
+  We deliberately do NOT offer a FROM-SCRATCH joint LoRA+QFormer path: per
+  CoLLM's ablations it underperforms, especially on cold users — the LoRA
+  gradient dominates early and the mapping module never learns to carry
+  collaborative information. Phase 3 is different: it co-adapts from ALREADY
+  good inits, the standard and safe way to let a frozen reader catch up.
 
 Freeze/unfreeze is handled per phase by building the optimizer over EXACTLY the
 intended parameter set and additionally flipping requires_grad, so a bug in one
@@ -191,7 +195,8 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                     batch_size: int, grad_accum: int, tag: str,
                     tracked_state_fn, llm_train: bool = True,
                     mix_hybrid_template: bool = False, weight_decay: float = 0.01,
-                    eval_every: int | None = None) -> tuple[CheckpointSelector, dict]:
+                    eval_every: int | None = None,
+                    dense_until: int = 0, dense_every: int = 0) -> tuple[CheckpointSelector, dict]:
     """One training loop shared by Phases 1/2/2b — they differ only in which
     parameters train and whether soft tokens are injected.
 
@@ -270,7 +275,9 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                       f"(bce {np.mean(history['bce'][-w:]):.4f} "
                       f"pair {np.mean(history['pair'][-w:]):.4f}) "
                       f"{rate:.2f} step/s", flush=True)
-            if step % eval_every == 0:
+            cadence = dense_every if (dense_until and step <= dense_until
+                                      and dense_every) else eval_every
+            if step % cadence == 0:
                 uids, labels, scores = _val_scores(cfg, llm, sasrec, qformer, val_ds,
                                                    device, hybrid)
                 stop = selector.update(step, uids, labels, scores, val_users,
@@ -428,7 +435,9 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         tag="phase2b" if cfg.unfreeze_sasrec else "phase2",
         tracked_state_fn=tracked_state, llm_train=False,
         weight_decay=cfg.phase2_weight_decay,
-        eval_every=cfg.phase2_eval_every_steps)
+        eval_every=cfg.phase2_eval_every_steps,
+        dense_until=cfg.phase2_dense_eval_until,
+        dense_every=cfg.phase2_dense_eval_every)
 
     # final model = GREEDY soup: candidates join only if they improve val UAUC
     sel_ds, sel_users = _selection_val_set(cfg, val_ds)
@@ -442,6 +451,24 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         return _uauc(u, l, s, sel_users)
 
     soup = selector.greedy_soup(_soup_eval, cfg.top_k_soup)
+
+    # Zero-token floor (#1): the soup only contains TRAINED QFormer checkpoints,
+    # so if every one is worse than the Phase-1 model (zero soft tokens) the
+    # final model would regress below Phase 1. Build the exact zero-token state
+    # (zero the projection OUTPUT layers -> tokens are identically 0) and adopt
+    # it if it beats the learned soup on val UAUC. Guarantees final >= Phase 1.
+    zkeys = set()
+    for nm in ("user_proj", "item_proj"):
+        last = len(getattr(qformer, nm)) - 1
+        zkeys |= {f"qformer.{nm}.{last}.weight", f"qformer.{nm}.{last}.bias"}
+    zero_state = {k: (torch.zeros_like(v) if k in zkeys else v) for k, v in soup.items()}
+    u_soup, u_zero = _soup_eval(soup), _soup_eval(zero_state)
+    if u_zero > u_soup:
+        print(f"[soup] zero-token floor {u_zero:.4f} > learned soup {u_soup:.4f} "
+              f"-> adopting Phase-1-equivalent (bridge added no val UAUC)")
+        soup = zero_state
+    else:
+        print(f"[soup] learned soup {u_soup:.4f} >= zero-token floor {u_zero:.4f} -> keeping bridge")
     load_tracked_state(soup, qformer, sasrec if cfg.unfreeze_sasrec else None)
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
     torch.save(soup, out / "qformer.pt")
@@ -477,6 +504,57 @@ def load_tracked_state(sd: dict, qformer, sasrec=None):
     if sasrec is not None and any(k.startswith("sasrec.") for k in sd):
         sasrec.load_state_dict({k[len("sasrec."):]: v for k, v in sd.items()
                                 if k.startswith("sasrec.")})
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 (optional): joint LoRA + QFormer co-adaptation
+# --------------------------------------------------------------------------- #
+
+def train_phase3(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
+    """Unfreeze LoRA AND QFormer together from their trained inits at a low lr,
+    so the reader can learn to DECODE the (now informative) soft tokens it was
+    never exposed to in Phase 1. Co-adaptation from good inits — distinct from
+    the from-scratch joint path the spec warns against."""
+    llm.set_lora_trainable(True)
+    qformer.requires_grad_(True)
+    sasrec.requires_grad_(False)
+    params = llm.trainable_lora_parameters() + list(qformer.parameters())
+
+    def tracked_state():
+        sd = {f"lora.{k}": v for k, v in llm.lora_state_dict().items()}
+        sd.update({f"qformer.{k}": v for k, v in qformer.state_dict().items()})
+        return sd
+
+    def load_state(sd):
+        llm.load_lora_state_dict({k[len("lora."):]: v for k, v in sd.items()
+                                  if k.startswith("lora.")})
+        qformer.load_state_dict({k[len("qformer."):]: v for k, v in sd.items()
+                                 if k.startswith("qformer.")})
+
+    selector, history = _llm_stage_loop(
+        cfg, llm, sasrec, qformer, train_ds, val_ds, device,
+        hybrid=True, params=params, lr=cfg.phase3_lr, epochs=cfg.phase3_epochs,
+        batch_size=cfg.phase2_batch_size, grad_accum=cfg.phase2_grad_accum,
+        tag="phase3", tracked_state_fn=tracked_state, llm_train=True,
+        weight_decay=cfg.phase2_weight_decay,
+        eval_every=cfg.phase2_eval_every_steps,
+        dense_until=cfg.phase2_dense_eval_until, dense_every=cfg.phase2_dense_eval_every)
+
+    sel_ds, sel_users = _selection_val_set(cfg, val_ds)
+
+    def _eval(state):
+        load_state(state)
+        u, l, s = score_dataset(llm, sasrec, qformer, sel_ds,
+                                batch_size=cfg.phase2_batch_size * 2,
+                                device=device, hybrid=True)
+        return uauc_fn(u, l, s, sel_users)
+
+    soup = selector.greedy_soup(_eval, cfg.top_k_soup)
+    load_state(soup)
+    out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
+    torch.save(soup, out / "phase3.pt")
+    print(f"[phase3] saved joint LoRA+QFormer -> {out / 'phase3.pt'}")
+    return selector, history
 
 
 # --------------------------------------------------------------------------- #
@@ -529,6 +607,10 @@ def run_all_phases(cfg: Config, seed: int | None = None):
 
     # Phase 2 (or 2b when cfg.unfreeze_sasrec)
     sel2, hist2 = train_phase2(cfg, llm, sasrec, qformer, train_ds, val_ds, device)
+
+    # Phase 3 (optional): joint co-adaptation so the reader learns the tokens
+    if cfg.phase3_joint_finetune:
+        train_phase3(cfg, llm, sasrec, qformer, train_ds, val_ds, device)
 
     return {"cfg": cfg, "seed": seed, "device": device,
             "datasets": (train_ds, val_ds, test_ds),

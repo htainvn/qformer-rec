@@ -18,7 +18,12 @@ class Config:
     # (0.6991 vs 0.6885 at L=10; L=150/200 decline) — the collaborative encoder
     # needs a longer view than the prompt text can carry.
     max_his_len: int = 100
-    prompt_titles: int = 10          # titles listed in the prompt text (template cap)
+    # titles listed in the prompt text. Raised 10 -> 20: the LLM previously saw
+    # only 10 of the 100 items SASRec encodes, starving the reader of the very
+    # signal (titles) that carries UAUC. More titles = longer prompt (slower,
+    # more memory) but directly lifts the text model. 20 is a length/signal
+    # balance; try 30 if context budget allows.
+    prompt_titles: int = 20
     smoke_test: bool = False         # tiny synthetic data + tiny backbone, CPU-friendly
 
     # ---- SASRec (collaborative backbone) -----------------------------------
@@ -54,15 +59,21 @@ class Config:
     align_lr: float = 1e-3
 
     # ---- LLM ----------------------------------------------------------------
-    backbone: str = "lmsys/vicuna-7b-v1.5"
-    lora_r: int = 8
-    lora_alpha: int = 16
+    # The collaborative UAUC signal saturates ~0.68 (SASRec == DIN, blends worse),
+    # while the LLM reading the TITLES already hits ~0.695 — so the lever for
+    # higher UAUC is a stronger reader, not a stronger encoder. Hence: bigger
+    # LoRA, all attention+MLP projections, and Qwen2.5-7B as an option.
+    backbone: str = "lmsys/vicuna-7b-v1.5"   # or "Qwen/Qwen2.5-7B" (base; tokenizer verified)
+    lora_r: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.05
-    lora_targets: tuple = ("q_proj", "v_proj")
+    lora_targets: tuple = ("q_proj", "k_proj", "v_proj", "o_proj",
+                           "gate_proj", "up_proj", "down_proj")
     load_4bit: bool = False          # set True to QLoRA-quantize the frozen backbone
 
     # ---- loss ---------------------------------------------------------------
-    lambda_pair: float = 0.5         # weight on within-user pairwise (BPR) ranking term
+    lambda_pair: float = 0.8         # within-user pairwise (BPR) weight; raised from
+                                     # 0.5 to push UAUC — watch that AUC does not drop
     pair_margin: float = 0.0         # 0.0 -> plain BPR softplus; >0 -> margin hinge
 
     # ---- Phase 1 (LoRA warm-up, text-only prompt) ---------------------------
@@ -71,7 +82,7 @@ class Config:
     # still rising (UAUC 0.6887->peak 0.6916, AUC still climbing), i.e. the
     # epoch limit cut training short, not the data.
     phase1_lr: float = 1e-4
-    phase1_epochs: int = 3
+    phase1_epochs: int = 5           # upper bound; patience early-stops at the plateau
     phase1_batch_size: int = 8
     phase1_grad_accum: int = 4
 
@@ -82,12 +93,29 @@ class Config:
     phase2_lr: float = 5e-4
     phase2_weight_decay: float = 0.05
     phase2_eval_every_steps: int = 250   # phase 2's peak is early and narrow
+    # dense early sampling: eval every `dense_every` steps until `dense_until`,
+    # then fall back to phase2_eval_every_steps. The observed peak was at step
+    # ~500 and narrow, so coarse 250-step sampling can miss it.
+    phase2_dense_eval_until: int = 1500
+    phase2_dense_eval_every: int = 50
     phase2_epochs: int = 3
     phase2_batch_size: int = 8
     phase2_grad_accum: int = 4
     unfreeze_sasrec: bool = False    # Phase 2b: also fine-tune SASRec
     sasrec_lr_2b: float = 1e-4       # 2b: SASRec fine-tunes 5x slower than the
                                      # bridge so it adapts, not forgets, Phase 0
+
+    # ---- Phase 3 (optional joint co-adaptation) ------------------------------
+    # In Phase 2 the LoRA is frozen, so it never learns to READ the (now
+    # informative) soft tokens — it only ever saw zero tokens in Phase 1. This
+    # short final phase unfreezes LoRA AND QFormer together, from their trained
+    # inits, at a low lr. NOTE this is a *co-adaptation from good inits*, which
+    # is standard and safe — NOT the from-scratch joint LoRA+QFormer path the
+    # spec warns against (that fails because LoRA gradient dominates a random
+    # mapping early). Default off.
+    phase3_joint_finetune: bool = False
+    phase3_lr: float = 5e-5          # low: both modules already near-good
+    phase3_epochs: int = 1
     users_per_batch: int = 4         # group sampler: users per batch (so same-user pairs exist)
 
     # ---- checkpoint selection ------------------------------------------------
