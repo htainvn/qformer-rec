@@ -99,13 +99,21 @@ md("""### ⚠️ FULL RUN — uncomment to train Vicuna-7B on the real ML-1M (GP
 This is the configuration used for the reported numbers: `lmsys/vicuna-7b-v1.5` frozen +
 LoRA(r=8, α=16 on q_proj/v_proj), 3 seeds, model soup of top-3 checkpoints. Expect several
 hours per seed on a single A100 (use `load_4bit=True` to fit smaller GPUs).""")
-code("""# cfg = Config()                       # full ML-1M + Vicuna-7B
+code("""# cfg = Config()                       # full ML-1M; defaults: Vicuna-7B, LoRA r16/a32
+#                                        # on 7 targets, 20 prompt titles, lambda_pair 0.8
+# cfg.phase3_joint_finetune = True       # reader co-adaptation (recommended)
 # cfg.n_seeds = 3                        # 3-5 seeds for the reported mean ± std
-# # selection evals: every 500 steps on a fixed 300-user val subset (defaults);
-# # cfg.val_subsample_users = 0 scores the full val split if you want it
+#
+# # --- backbone tracks ---
+# # Vicuna (default): direct comparison against published CoLLM/BinLLM numbers
+# # cfg.backbone = "Qwen/Qwen2.5-7B"     # modern-reader track (tokenizer verified);
+# #                                      # NOT comparable to published Vicuna baselines
+#
+# # --- other switches ---
+# # cfg.val_subsample_users = 0          # selection on full val (default: 300 users)
 # # cfg.load_4bit = True                 # QLoRA-quantize the frozen backbone if VRAM-bound
 # # cfg.unfreeze_sasrec = True           # Phase 2b variant
-# # cfg.qformer_align_pretrain = True    # optional contrastive QFormer init
+# # cfg.design2 = True                   # DIN-fused values (measured no-go on ML-1M)
 # SEEDS = list(range(cfg.seed, cfg.seed + cfg.n_seeds))
 # print(f"backbone={cfg.backbone}  seeds={SEEDS}")""")
 
