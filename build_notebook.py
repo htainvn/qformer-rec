@@ -57,6 +57,17 @@ CoLLM ML-1M data. On a **T4 (16 GB)** use `cfg.load_4bit = True` for the full Vi
 run; an A100 runs it in bf16 without quantization.""")
 code("""import sys, os
 if "google.colab" in sys.modules and not os.path.exists("config.py"):
+    # HF auth + accelerated downloads: unauthenticated requests are rate-limited,
+    # which matters for the ~15GB backbone pulls. Add a (free) HF token under
+    # Colab's key icon (Secrets) as HF_TOKEN to use it.
+    try:
+        from google.colab import userdata
+        os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
+        print("HF_TOKEN loaded from Colab secrets")
+    except Exception:
+        print("no HF_TOKEN secret found (downloads will be rate-limited)")
+    %pip -q install hf_transfer
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     !git clone https://github.com/htainvn/qformer-rec.git repo_src
     %cd repo_src
     %pip -q install peft accelerate bitsandbytes
