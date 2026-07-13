@@ -127,6 +127,23 @@ code("""# cfg = Config()                       # full ML-1M; defaults: Vicuna-7B
 # # cfg.design2 = True                   # DIN-fused values (measured no-go on ML-1M)
 # SEEDS = list(range(cfg.seed, cfg.seed + cfg.n_seeds))
 # print(f"backbone={cfg.backbone}  seeds={SEEDS}")""")
+md("""### Pre-download the backbone
+Runs the (possibly long) weight download as its own step with visible progress,
+so the training cells start instantly afterward.""")
+code("""# Pre-download the backbone weights BEFORE training (one-time per VM, cached).
+# Filtered to safetensors + tokenizer files: Vicuna's repo hosts BOTH .bin and
+# .safetensors copies (~13.5GB each) and an unfiltered fetch can pull both.
+if not cfg.smoke_test:
+    from huggingface_hub import snapshot_download
+    path = snapshot_download(
+        cfg.backbone,
+        allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json",
+                        "generation_config.json", "tokenizer*", "*.model",
+                        "vocab*", "merges*", "special_tokens*"])
+    print("backbone cached at:", path)
+else:
+    print("smoke mode - tiny backbone downloads in seconds, no pre-fetch needed")""")
+
 
 # ----------------------------------------------------------------------- 2
 md("""## 1 · Data
