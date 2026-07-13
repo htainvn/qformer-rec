@@ -211,6 +211,32 @@ ax[1].plot(steps2, auc2, "--", label="val AUC")
 ax[1].set_title("Phase 2 validation"); ax[1].set_xlabel("step"); ax[1].legend()
 plt.tight_layout(); plt.show()""")
 
+# ----------------------------------------------------------------------- 5b
+md("""## 4b · Phase 3 (optional) — joint LoRA + QFormer co-adaptation
+
+Runs only when `cfg.phase3_joint_finetune=True`. In Phase 2 the LoRA is frozen, so it
+never learns to *decode* the now-informative soft tokens — it only ever saw zero tokens
+in Phase 1. Phase 3 unfreezes LoRA **and** QFormer together from their trained inits at
+a low lr (5e-5). This is co-adaptation from good inits — distinct from the from-scratch
+joint path the spec forbids (that fails because the LoRA gradient dominates a random
+mapping). Selection/greedy-soup machinery applies as in Phase 2.""")
+code("""if cfg.phase3_joint_finetune:
+    from train import train_phase3
+    sel3, hist3 = train_phase3(cfg, llm, sasrec, qformer, train_ds, val_ds, DEVICE)
+
+    steps3, raw3, smooth3, auc3 = sel3.curves()
+    fig, ax = plt.subplots(1, 2, figsize=(11, 3.5))
+    ax[0].plot(np.convolve(hist3["loss"], np.ones(20)/20, mode="valid"), lw=2,
+               label="total (MA-20)")
+    ax[0].set_title("Phase 3 train loss"); ax[0].set_xlabel("step"); ax[0].legend()
+    ax[1].plot(steps3, raw3, "o-", alpha=.5, label="val UAUC (raw)")
+    ax[1].plot(steps3, smooth3, "-", lw=2, label=f"smoothed (w={cfg.sel_window})")
+    ax[1].plot(steps3, auc3, "--", label="val AUC")
+    ax[1].set_title("Phase 3 validation"); ax[1].set_xlabel("step"); ax[1].legend()
+    plt.tight_layout(); plt.show()
+else:
+    print("Phase 3 disabled (cfg.phase3_joint_finetune=False) — using the Phase-2 model")""")
+
 # ----------------------------------------------------------------------- 6
 md("""## 5 · Model soup + test evaluation (seed 0)
 
