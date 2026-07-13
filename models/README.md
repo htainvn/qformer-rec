@@ -66,3 +66,15 @@ ablate, and seed-sweep.
 Migration path if needed: pre-train DIN with the same Phase-0 CTR objective,
 freeze both encoders, widen `QFormerLayer`'s cross-attention `kdim/vdim` to
 `d + d_din`, set `target_aware=False`, and rerun Phase 2 only.
+
+## Measured negative results (ML-1M, val, UAUC-selected — so nobody re-tries them blind)
+
+| Idea | Result | Verdict |
+|---|---|---|
+| BPR pairwise term in Phase 0 | 0.6709–0.6742 vs 0.6763 baseline | no gain |
+| 3-seed SASRec score ensemble | 0.6769 vs 0.6763 | noise |
+| DIN encoder (Design 2 go/no-go) | 0.6766 vs 0.6763; blend 0.6744 | same signal as SASRec |
+| AR next-item pretrain -> CTR finetune | 0.6962/0.6673 vs 0.6966/0.6763 | transfers nothing (601 users, mean seq 27) |
+
+Collaborative UAUC on this dataset saturates at ~0.68 across every encoder and
+training recipe tried; the reader (LLM) side is where the remaining headroom lives.
