@@ -229,7 +229,8 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
           f"backbone {backbone_dt}, grad scaler {'ON' if scaler.is_enabled() else 'off'}")
 
     selector = CheckpointSelector(sel_window=cfg.sel_window, top_k=cfg.top_k_soup,
-                                  patience=cfg.patience, n_boot=cfg.n_boot, seed=cfg.seed)
+                                  patience=cfg.patience, n_boot=cfg.n_boot, seed=cfg.seed,
+                                  sel_metric=cfg.sel_metric, guard_tol=cfg.sel_guard_tol)
     history = {"loss": [], "bce": [], "pair": []}
     step, stop = 0, False
     t_last, step_last = time.time(), 0
@@ -447,8 +448,8 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         u, l, s = score_dataset(llm, sasrec, qformer, sel_ds,
                                 batch_size=cfg.phase2_batch_size * 2,
                                 device=device, hybrid=True)
-        from evaluate import uauc as _uauc
-        return _uauc(u, l, s, sel_users)
+        a, uu = auc_fn(l, s), uauc_fn(u, l, s, sel_users)
+        return (a, uu) if cfg.sel_metric == "auc" else (uu, a)
 
     soup = selector.greedy_soup(_soup_eval, cfg.top_k_soup)
 
@@ -462,13 +463,14 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         last = len(getattr(qformer, nm)) - 1
         zkeys |= {f"qformer.{nm}.{last}.weight", f"qformer.{nm}.{last}.bias"}
     zero_state = {k: (torch.zeros_like(v) if k in zkeys else v) for k, v in soup.items()}
-    u_soup, u_zero = _soup_eval(soup), _soup_eval(zero_state)
-    if u_zero > u_soup:
-        print(f"[soup] zero-token floor {u_zero:.4f} > learned soup {u_soup:.4f} "
-              f"-> adopting Phase-1-equivalent (bridge added no val UAUC)")
+    (p_soup, g_soup), (p_zero, g_zero) = _soup_eval(soup), _soup_eval(zero_state)
+    if p_zero > p_soup and g_zero >= g_soup - cfg.sel_guard_tol:
+        print(f"[soup] zero-token floor {cfg.sel_metric} {p_zero:.4f} > learned "
+              f"{p_soup:.4f} (guard ok) -> adopting Phase-1-equivalent")
         soup = zero_state
     else:
-        print(f"[soup] learned soup {u_soup:.4f} >= zero-token floor {u_zero:.4f} -> keeping bridge")
+        print(f"[soup] learned soup {cfg.sel_metric} {p_soup:.4f} guard {g_soup:.4f} "
+              f"vs floor {p_zero:.4f}/{g_zero:.4f} -> keeping bridge")
     load_tracked_state(soup, qformer, sasrec if cfg.unfreeze_sasrec else None)
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
     torch.save(soup, out / "qformer.pt")
@@ -547,7 +549,8 @@ def train_phase3(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         u, l, s = score_dataset(llm, sasrec, qformer, sel_ds,
                                 batch_size=cfg.phase2_batch_size * 2,
                                 device=device, hybrid=True)
-        return uauc_fn(u, l, s, sel_users)
+        a, uu = auc_fn(l, s), uauc_fn(u, l, s, sel_users)
+        return (a, uu) if cfg.sel_metric == "auc" else (uu, a)
 
     soup = selector.greedy_soup(_eval, cfg.top_k_soup)
     load_state(soup)

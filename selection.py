@@ -1,21 +1,20 @@
-"""Robust checkpoint selection.
+"""Robust checkpoint selection, metric-generic (primary + guard).
 
-With only ~800 validation users, per-step val UAUC is noisy: picking the argmax
-checkpoint mostly picks the luckiest evaluation, which does not transfer to test.
-Three defenses, applied in order:
+CoLLM/BinLLM select checkpoints by raw val AUC (their code: agg_metrics = auc;
+uauc only logged). We keep AUC-primary comparability but defend both metrics:
 
-  1. SMOOTHING — the selection signal is a trailing moving average of val UAUC
-     over `sel_window` evals, killing single-eval spikes.
-  2. NOISE BAND — a bootstrap CI (over validation users) around the best smoothed
-     UAUC defines a band; checkpoints inside the band are considered ties and the
-     tie is broken by val AUC. AUC only ever breaks ties INSIDE the band — it can
-     never override a real UAUC gap.
-  3. MODEL SOUP — the final model is the WEIGHT AVERAGE of the top-k checkpoints
-     by smoothed UAUC (LoRA + QFormer tensors averaged elementwise). Nearby
-     fine-tuning optima are linearly connected, so the average sits in a flatter
-     region of the loss surface and cancels per-step selection noise.
+  1. SMOOTHING — the selection signal is a trailing moving average of the
+     PRIMARY metric over `sel_window` evals, killing single-eval spikes.
+  2. NOISE BAND — an exact bootstrap CI (resampling users on the best point's
+     stored raw scores) around the best smoothed primary defines a band;
+     checkpoints inside it are ties, broken by the GUARD metric. The guard can
+     never override a real primary gap.
+  3. GREEDY SOUP — weight-average grown one checkpoint at a time; a candidate
+     is admitted only if the measured primary improves AND the guard does not
+     drop by more than `guard_tol`. Provably no worse than the best single
+     checkpoint on the primary, and guard-protected by construction.
 
-Also provides patience-based early stopping on the smoothed UAUC.
+Also provides patience-based early stopping on the smoothed primary.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from evaluate import per_user_auc
+from evaluate import per_user_auc, auc as auc_fn, uauc as uauc_fn
 
 
 @dataclass
@@ -33,9 +32,14 @@ class EvalPoint:
     step: int
     uauc: float
     auc: float
-    smoothed_uauc: float
-    per_user: dict            # {uid: (auc, support)} — kept for the noise band
-    state: dict               # cpu state_dict of the trainable parts
+    smoothed: float           # trailing mean of the PRIMARY metric
+    uids: np.ndarray          # raw val arrays -> exact bootstrap for any metric
+    labels: np.ndarray
+    scores: np.ndarray
+    state: dict               # cpu state_dict of the trainable parts (or None if pruned)
+
+    def metric(self, name: str) -> float:
+        return self.auc if name == "auc" else self.uauc
 
 
 @dataclass
@@ -45,65 +49,81 @@ class CheckpointSelector:
     patience: int = 6
     n_boot: int = 1000
     seed: int = 0
+    sel_metric: str = "uauc"      # primary; the other of auc/uauc is the guard
+    guard_tol: float = 0.003
     keep_states: int = 12   # states are big (QFormer->4096 heads); metrics are kept
     history: list = field(default_factory=list)  # for ALL points, states only for
     _stale: int = 0                              # the top `keep_states` candidates
 
+    @property
+    def guard_metric(self) -> str:
+        return "uauc" if self.sel_metric == "auc" else "auc"
+
     def update(self, step: int, uids, labels, scores, users, state: dict) -> bool:
         """Record one evaluation. Returns True if training should STOP (patience
-        exhausted on the smoothed signal)."""
-        from evaluate import auc as auc_fn
+        exhausted on the smoothed primary)."""
         pu = per_user_auc(uids, labels, scores, users)
-        raw = float(np.mean([a for a, _ in pu.values()]))
-        window = [p.uauc for p in self.history[-(self.sel_window - 1):]] + [raw]
-        smoothed = float(np.mean(window))
+        raw_uauc = float(np.mean([a for a, _ in pu.values()]))
+        raw_auc = auc_fn(labels, scores)
+        raw_primary = raw_auc if self.sel_metric == "auc" else raw_uauc
+        window = [p.metric(self.sel_metric) for p in self.history[-(self.sel_window - 1):]]
+        smoothed = float(np.mean(window + [raw_primary]))
         self.history.append(EvalPoint(
-            step=step, uauc=raw, auc=auc_fn(labels, scores),
-            smoothed_uauc=smoothed, per_user=pu,
+            step=step, uauc=raw_uauc, auc=raw_auc, smoothed=smoothed,
+            uids=np.asarray(uids, dtype=np.int32),
+            labels=np.asarray(labels, dtype=np.float32),
+            scores=np.asarray(scores, dtype=np.float32),
             state={k: v.detach().cpu().clone() for k, v in state.items()}))
-        print(f"[select] step {step}: val UAUC {raw:.4f} (smoothed {smoothed:.4f}) "
-              f"val AUC {self.history[-1].auc:.4f}")
+        print(f"[select] step {step}: val UAUC {raw_uauc:.4f} val AUC {raw_auc:.4f} "
+              f"(smoothed {self.sel_metric} {smoothed:.4f})")
 
-        best = max(p.smoothed_uauc for p in self.history)
+        best = max(p.smoothed for p in self.history)
         if smoothed >= best - 1e-9:
             self._stale = 0
         else:
             self._stale += 1
 
         # bound memory: drop the STATE (not the metrics) of checkpoints that can
-        # no longer plausibly enter the soup — everything below the top
-        # `keep_states` by smoothed UAUC. Curves and the noise band stay exact.
+        # no longer plausibly enter the soup. Curves and the band stay exact.
         with_state = [p for p in self.history if p.state is not None]
         if len(with_state) > self.keep_states:
-            with_state.sort(key=lambda p: p.smoothed_uauc, reverse=True)
+            with_state.sort(key=lambda p: p.smoothed, reverse=True)
             for p in with_state[self.keep_states:]:
                 p.state = None
         return self._stale >= self.patience
 
     # ------------------------------------------------------------------ #
     def _noise_band(self) -> float:
-        """Half-width of the bootstrap CI on the BEST checkpoint's val UAUC —
-        the resolution below which two checkpoints are indistinguishable."""
-        best = max(self.history, key=lambda p: p.smoothed_uauc)
-        aucs = np.array([a for a, _ in best.per_user.values()])
+        """Half-width of the bootstrap CI (resampling USERS) of the PRIMARY
+        metric on the best checkpoint's stored raw scores — the resolution
+        below which two checkpoints are indistinguishable."""
+        best = max(self.history, key=lambda p: p.smoothed)
         rng = np.random.default_rng(self.seed)
-        boots = rng.choice(aucs, size=(self.n_boot, len(aucs)), replace=True).mean(axis=1)
-        lo, hi = np.quantile(boots, [0.025, 0.975])
+        users = np.unique(best.uids)
+        rows_of = {u: np.flatnonzero(best.uids == u) for u in users}
+        stats = []
+        for _ in range(min(self.n_boot, 300)):   # exact resample; 300 is ample for a band
+            take = np.concatenate([rows_of[u] for u in rng.choice(users, size=len(users))])
+            l, s = best.labels[take], best.scores[take]
+            if l.min() == l.max():
+                continue
+            stats.append(auc_fn(l, s) if self.sel_metric == "auc"
+                         else uauc_fn(best.uids[take], l, s))
+        lo, hi = np.quantile(stats, [0.025, 0.975])
         return float(hi - lo) / 2
 
     def rank(self) -> list[EvalPoint]:
-        """Checkpoints ordered best-first: smoothed UAUC desc, but within the
-        noise band ties break by val AUC (never across a real UAUC gap)."""
+        """Checkpoints best-first: smoothed primary desc; within the noise band
+        ties break by the GUARD metric (never across a real primary gap)."""
         band = self._noise_band()
-        # only checkpoints whose state was retained can be selected/souped
         pts = sorted((p for p in self.history if p.state is not None),
-                     key=lambda p: p.smoothed_uauc, reverse=True)
-        best_u = pts[0].smoothed_uauc
-        in_band = [p for p in pts if best_u - p.smoothed_uauc <= band]
-        out_band = [p for p in pts if best_u - p.smoothed_uauc > band]
-        # inside the band, AUC decides; outside, smoothed UAUC order stands
-        in_band.sort(key=lambda p: p.auc, reverse=True)
-        print(f"[select] noise band ±{band:.4f}: {len(in_band)} checkpoint(s) tied at top")
+                     key=lambda p: p.smoothed, reverse=True)
+        best_p = pts[0].smoothed
+        in_band = [p for p in pts if best_p - p.smoothed <= band]
+        out_band = [p for p in pts if best_p - p.smoothed > band]
+        in_band.sort(key=lambda p: p.metric(self.guard_metric), reverse=True)
+        print(f"[select] noise band ±{band:.4f} on {self.sel_metric}: "
+              f"{len(in_band)} checkpoint(s) tied at top; ties broken by {self.guard_metric}")
         return in_band + out_band
 
     @staticmethod
@@ -115,43 +135,42 @@ class CheckpointSelector:
         return avg
 
     def soup(self, k: int | None = None) -> dict:
-        """Weight-average (uniform soup) of the top-k checkpoints' states."""
+        """Blind uniform soup of the top-k (kept for reference; greedy preferred)."""
         k = k or self.top_k
         top = self.rank()[:k]
         print(f"[select] souping {len(top)} checkpoints from steps {[p.step for p in top]}")
         return self._avg([p.state for p in top])
 
     def greedy_soup(self, eval_fn, k: int | None = None) -> dict:
-        """Wortsman-style greedy soup: start from the best checkpoint and add
-        the next-ranked candidate ONLY if the averaged weights improve val UAUC
-        (eval_fn: state_dict -> val UAUC). Uniform averaging assumes the
-        checkpoints share a linearly-connected basin — false for a from-scratch
-        bridge whose distant checkpoints implement different attention
-        solutions, where blind averaging interferes destructively. Greedy
-        verification makes the soup provably no worse than the best single
-        checkpoint, at the cost of a few extra val passes."""
+        """Guarded greedy soup. eval_fn(state) -> (primary, guard) measured on
+        the selection val set. A candidate joins only if the primary improves
+        AND the guard does not drop more than guard_tol below the best guard
+        seen in the soup so far. Provably no worse than the best checkpoint on
+        the primary; guard-protected by construction."""
         k = k or self.top_k
         cands = self.rank()[:k + 2]              # a couple of spares to try
         members = [cands[0].state]
-        best_u = eval_fn(cands[0].state)
-        print(f"[soup] base = step {cands[0].step}: val UAUC {best_u:.4f}")
+        best_p, best_g = eval_fn(cands[0].state)
+        print(f"[soup] base = step {cands[0].step}: "
+              f"{self.sel_metric} {best_p:.4f} {self.guard_metric} {best_g:.4f}")
         for p in cands[1:]:
             if len(members) >= k:
                 break
             trial = self._avg(members + [p.state])
-            u = eval_fn(trial)
-            keep = u > best_u
-            print(f"[soup] + step {p.step}: val UAUC {u:.4f} ({'kept' if keep else 'rejected'})")
+            tp, tg = eval_fn(trial)
+            keep = tp > best_p and tg >= best_g - self.guard_tol
+            print(f"[soup] + step {p.step}: {self.sel_metric} {tp:.4f} "
+                  f"{self.guard_metric} {tg:.4f} ({'kept' if keep else 'rejected'})")
             if keep:
                 members.append(p.state)
-                best_u = u
+                best_p, best_g = tp, max(best_g, tg)
         return self._avg(members) if len(members) > 1 else members[0]
 
     def best_state(self) -> dict:
         return copy.deepcopy(self.rank()[0].state)
 
     def curves(self):
-        """(steps, raw_uauc, smoothed_uauc, auc) for plotting."""
+        """(steps, raw_uauc, smoothed_primary, raw_auc) for plotting."""
         h = self.history
         return ([p.step for p in h], [p.uauc for p in h],
-                [p.smoothed_uauc for p in h], [p.auc for p in h])
+                [p.smoothed for p in h], [p.auc for p in h])

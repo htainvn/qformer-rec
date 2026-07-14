@@ -127,6 +127,13 @@ class Config:
     # val subsample keeps ~25 selection points over 3 epochs (plenty for the
     # smoothing window, top-k soup, and patience) at ~1/3 of the wall-clock.
     # Per-epoch evals would be too coarse: 3 points can't feed any of them.
+    # Selection primary metric. CoLLM/BinLLM select checkpoints by val AUC
+    # (verified in their code: agg_metrics = auc; uauc only logged). We select
+    # on AUC too but add a GUARD: within the noise band ties break by the guard
+    # metric, and greedy-soup members are admitted only if the primary improves
+    # AND the guard does not drop by more than sel_guard_tol.
+    sel_metric: str = "auc"          # "auc" | "uauc"; the other becomes the guard
+    sel_guard_tol: float = 0.003
     log_every_steps: int = 50        # print running train loss every this many steps
     eval_every_steps: int = 500      # evaluate val AUC/UAUC every this many steps
     sel_window: int = 5              # moving-average window for smoothed val UAUC —
