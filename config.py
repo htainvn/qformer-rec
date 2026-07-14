@@ -103,10 +103,12 @@ class Config:
     phase2_weight_decay: float = 0.05
     phase2_eval_every_steps: int = 250   # phase 2's peak is early and narrow
     # dense early sampling: eval every `dense_every` steps until `dense_until`,
-    # then fall back to phase2_eval_every_steps. The observed peak was at step
-    # ~500 and narrow, so coarse 250-step sampling can miss it.
-    phase2_dense_eval_until: int = 1500
-    phase2_dense_eval_every: int = 50
+    # then fall back to phase2_eval_every_steps. The peak is early (observed at
+    # steps ~50-500), but 50-step evals cost ~3.4min each for ~15s of training
+    # (~93% eval wall-clock) AND shrink patience to 350 steps (patience counts
+    # EVALS). 150 keeps 6 early looks while patience covers >=1050 steps.
+    phase2_dense_eval_until: int = 900
+    phase2_dense_eval_every: int = 150
     phase2_epochs: int = 3
     phase2_batch_size: int = 8
     phase2_grad_accum: int = 4
