@@ -18,12 +18,11 @@ class Config:
     # (0.6991 vs 0.6885 at L=10; L=150/200 decline) — the collaborative encoder
     # needs a longer view than the prompt text can carry.
     max_his_len: int = 100
-    # titles listed in the prompt text. Raised 10 -> 20: the LLM previously saw
-    # only 10 of the 100 items SASRec encodes, starving the reader of the very
-    # signal (titles) that carries UAUC. More titles = longer prompt (slower,
-    # more memory) but directly lifts the text model. 20 is a length/signal
-    # balance; try 30 if context budget allows.
-    prompt_titles: int = 20
+    # titles listed in the prompt text. MEASURED: raising to 20 (with the
+    # bigger LoRA + lambda 0.8) made Phase 1 WORSE (~0.69 AUC / 0.679 UAUC vs
+    # 0.717/0.695 at 10) — the extra titles are older, weaker-signal history
+    # that dilutes the prompt. 10 is the proven value.
+    prompt_titles: int = 10
     smoke_test: bool = False         # tiny synthetic data + tiny backbone, CPU-friendly
 
     # ---- SASRec (collaborative backbone) -----------------------------------
@@ -59,24 +58,24 @@ class Config:
     align_lr: float = 1e-3
 
     # ---- LLM ----------------------------------------------------------------
-    # The collaborative UAUC signal saturates ~0.68 (SASRec == DIN, blends worse),
-    # while the LLM reading the TITLES already hits ~0.695 — so the lever for
-    # higher UAUC is a stronger reader, not a stronger encoder. Hence: bigger
-    # LoRA, all attention+MLP projections, and Qwen2.5-7B as an option.
+    # The collaborative UAUC signal saturates ~0.68 (SASRec == DIN, blends
+    # worse); the reader is the lever — but MEASURED: r=16 on all 7 projections
+    # (40M params) UNDERPERFORMED r=8 on q/v (4M) by ~2pts on 34k samples
+    # (capacity >> data). The gentle adapter is the proven recipe; the
+    # stronger-reader lever that remains open is the BACKBONE (Qwen2.5-7B).
     backbone: str = "lmsys/vicuna-7b-v1.5"   # or "Qwen/Qwen2.5-7B" (base; tokenizer verified)
-    lora_r: int = 16
-    lora_alpha: int = 32
+    lora_r: int = 8
+    lora_alpha: int = 16
     lora_dropout: float = 0.05
-    lora_targets: tuple = ("q_proj", "k_proj", "v_proj", "o_proj",
-                           "gate_proj", "up_proj", "down_proj")
+    lora_targets: tuple = ("q_proj", "v_proj")
     load_4bit: bool = False          # set True to QLoRA-quantize the frozen backbone
 
     # ---- loss ---------------------------------------------------------------
-    # Within-user pairwise (BPR) weight. Measured on the full Vicuna run:
-    # 0.8 traded ~1pt of val AUC for no UAUC gain vs 0.5 — BPR is invariant to
-    # per-user score shifts, so upweighting it decalibrates the CROSS-user
-    # ordering that pooled AUC measures. 0.6 is the compromise default.
-    lambda_pair: float = 0.6
+    # Within-user pairwise (BPR) weight. MEASURED: 0.8 traded ~1pt val AUC for
+    # no UAUC gain (BPR is invariant to per-user score shifts, so upweighting
+    # it decalibrates the cross-user ordering pooled AUC measures). 0.5 is the
+    # value the best observed run used.
+    lambda_pair: float = 0.5
     pair_margin: float = 0.0         # 0.0 -> plain BPR softplus; >0 -> margin hinge
 
     # ---- Phase 1 (LoRA warm-up, text-only prompt) ---------------------------
