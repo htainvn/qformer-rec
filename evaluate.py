@@ -21,9 +21,15 @@ from sklearn.metrics import roc_auc_score
 
 # Published ML-1M baselines (CoLLM paper, arXiv:2310.19488; BinLLM) and our targets.
 BASELINES = {
+    # Vicuna-7B track (directly comparable to our default backbone)
     "CoLLM-SASRec": {"uauc": 0.6990, "auc": 0.7235},
     "BinLLM":       {"uauc": 0.6956, "auc": 0.7425},
     "CoLLM-MF":     {"uauc": 0.6875, "auc": None},
+    "CoRA-MF (AAAI'25)": {"uauc": 0.6884, "auc": 0.7361},
+    # Qwen2-class track (SeLLa-Rec re-based every baseline on Qwen2-7B;
+    # NOT comparable to the Vicuna rows above)
+    "SeLLa-Rec (Qwen2)":   {"uauc": 0.7464, "auc": 0.7606},
+    "CoLLM (Qwen2 rerun)": {"uauc": 0.7179, "auc": 0.7357},
 }
 TARGETS = {"uauc": 0.71, "auc": 0.75}
 
