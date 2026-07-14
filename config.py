@@ -72,8 +72,11 @@ class Config:
     load_4bit: bool = False          # set True to QLoRA-quantize the frozen backbone
 
     # ---- loss ---------------------------------------------------------------
-    lambda_pair: float = 0.8         # within-user pairwise (BPR) weight; raised from
-                                     # 0.5 to push UAUC — watch that AUC does not drop
+    # Within-user pairwise (BPR) weight. Measured on the full Vicuna run:
+    # 0.8 traded ~1pt of val AUC for no UAUC gain vs 0.5 — BPR is invariant to
+    # per-user score shifts, so upweighting it decalibrates the CROSS-user
+    # ordering that pooled AUC measures. 0.6 is the compromise default.
+    lambda_pair: float = 0.6
     pair_margin: float = 0.0         # 0.0 -> plain BPR softplus; >0 -> margin hinge
 
     # ---- Phase 1 (LoRA warm-up, text-only prompt) ---------------------------
