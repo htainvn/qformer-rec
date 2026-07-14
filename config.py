@@ -147,10 +147,12 @@ class Config:
                                      # val UAUC noise is ~±0.025 on ML-1M's 282
                                      # qualifying users; window 3 under-smoothed
     top_k_soup: int = 3              # weight-average the top-k checkpoints (model soup)
-    # patience is in EVALS: with eval_every_steps=200 and grad_accum=4 that is
-    # only 50 optimizer updates per eval — 6 evals killed Phase 2 after ~300
-    # updates on the observed run, before the QFormer had learned anything
-    patience: int = 12               # early stop after this many evals w/o smoothed-UAUC gain
+    # patience is in EVALS on the smoothed primary metric. History: 6 was too
+    # tight (killed Phase 2 after ~300 optimizer updates, before the bridge
+    # learned anything at the old 200-step cadence); 12 let declining runs
+    # burn hours past their peak. 7 at the current cadences = ~3.5k Phase-1
+    # steps / ~1.75k Phase-2 steps of no-improvement tolerance.
+    patience: int = 7                # early stop after this many evals w/o smoothed gain
     n_boot: int = 1000               # bootstrap resamples (over users) for CIs
 
     # ---- evaluation -----------------------------------------------------------
