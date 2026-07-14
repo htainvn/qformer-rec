@@ -57,9 +57,15 @@ CoLLM ML-1M data. On a **T4 (16 GB)** use `cfg.load_4bit = True` for the full Vi
 run; an A100 runs it in bf16 without quantization.""")
 code("""import sys, os
 if "google.colab" in sys.modules and not os.path.exists("config.py"):
-    # HF auth + accelerated downloads: unauthenticated requests are rate-limited,
-    # which matters for the ~15GB backbone pulls. Add a (free) HF token under
-    # Colab's key icon (Secrets) as HF_TOKEN to use it.
+    # MUST be set before huggingface_hub is ever imported (it reads these into
+    # module constants at import time). Xet is disabled outright: its CAS
+    # servers 401 on fine-grained tokens even when whoami() passes, and the
+    # classic HTTP path is equally fast here with hf_transfer.
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    # HF auth: unauthenticated requests are rate-limited, which matters for the
+    # ~15GB backbone pulls. Add a (free, CLASSIC 'Read') token under Colab's
+    # key icon (Secrets) as HF_TOKEN.
     try:
         from google.colab import userdata
         os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN").strip()
@@ -71,7 +77,6 @@ if "google.colab" in sys.modules and not os.path.exists("config.py"):
         os.environ.pop("HF_TOKEN", None)
         print(f"HF_TOKEN missing/invalid ({type(e).__name__}) -> anonymous downloads")
     %pip -q install hf_transfer
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     !git clone https://github.com/htainvn/qformer-rec.git repo_src
     %cd repo_src
     %pip -q install peft accelerate bitsandbytes
@@ -148,9 +153,11 @@ if not cfg.smoke_test:
                           "*.model", "vocab*", "merges*", "special_tokens*"]
     try:
         path = snapshot_download(cfg.backbone, allow_patterns=patterns)
-    except RuntimeError as e:   # Xet/CAS backend failure -> classic HTTP path
-        print(f"xet download failed ({e}); retrying with HF_HUB_DISABLE_XET=1")
-        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    except RuntimeError as e:   # Xet/CAS backend failure -> classic HTTP path.
+        # NB: the env var is read at import time; patch the live constant too.
+        from huggingface_hub import constants
+        constants.HF_HUB_DISABLE_XET = True
+        print(f"xet download failed ({e}); retrying via classic HTTP")
         path = snapshot_download(cfg.backbone, allow_patterns=patterns)
     print(f"backbone cached at: {path}  (format: {'safetensors' if has_st else 'bin'})")
 else:
