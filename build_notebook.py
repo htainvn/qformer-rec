@@ -62,10 +62,14 @@ if "google.colab" in sys.modules and not os.path.exists("config.py"):
     # Colab's key icon (Secrets) as HF_TOKEN to use it.
     try:
         from google.colab import userdata
-        os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
-        print("HF_TOKEN loaded from Colab secrets")
-    except Exception:
-        print("no HF_TOKEN secret found (downloads will be rate-limited)")
+        os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN").strip()
+        from huggingface_hub import whoami
+        print("HF token OK:", whoami()["name"])
+    except Exception as e:
+        # an INVALID token is worse than none: HF's Xet storage returns
+        # 401 on bad credentials where anonymous requests would succeed
+        os.environ.pop("HF_TOKEN", None)
+        print(f"HF_TOKEN missing/invalid ({type(e).__name__}) -> anonymous downloads")
     %pip -q install hf_transfer
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     !git clone https://github.com/htainvn/qformer-rec.git repo_src
@@ -140,11 +144,14 @@ if not cfg.smoke_test:
     has_st = any(f.endswith(".safetensors") for f in files)
     weights = (["*.safetensors", "*.safetensors.index.json"] if has_st
                else ["*.bin", "*.bin.index.json"])
-    path = snapshot_download(
-        cfg.backbone,
-        allow_patterns=weights + ["config.json", "generation_config.json",
-                                  "tokenizer*", "*.model", "vocab*", "merges*",
-                                  "special_tokens*"])
+    patterns = weights + ["config.json", "generation_config.json", "tokenizer*",
+                          "*.model", "vocab*", "merges*", "special_tokens*"]
+    try:
+        path = snapshot_download(cfg.backbone, allow_patterns=patterns)
+    except RuntimeError as e:   # Xet/CAS backend failure -> classic HTTP path
+        print(f"xet download failed ({e}); retrying with HF_HUB_DISABLE_XET=1")
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        path = snapshot_download(cfg.backbone, allow_patterns=patterns)
     print(f"backbone cached at: {path}  (format: {'safetensors' if has_st else 'bin'})")
 else:
     print("smoke mode - tiny backbone downloads in seconds, no pre-fetch needed")""")
