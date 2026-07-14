@@ -131,16 +131,21 @@ md("""### Pre-download the backbone
 Runs the (possibly long) weight download as its own step with visible progress,
 so the training cells start instantly afterward.""")
 code("""# Pre-download the backbone weights BEFORE training (one-time per VM, cached).
-# Filtered to safetensors + tokenizer files: Vicuna's repo hosts BOTH .bin and
-# .safetensors copies (~13.5GB each) and an unfiltered fetch can pull both.
+# Pulls whichever weight format the repo actually hosts: Qwen ships safetensors;
+# Vicuna ships ONLY .bin (the model loader is configured to use those directly
+# instead of fetching the Hub's auto-converted safetensors duplicate).
 if not cfg.smoke_test:
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import list_repo_files, snapshot_download
+    files = list_repo_files(cfg.backbone)
+    has_st = any(f.endswith(".safetensors") for f in files)
+    weights = (["*.safetensors", "*.safetensors.index.json"] if has_st
+               else ["*.bin", "*.bin.index.json"])
     path = snapshot_download(
         cfg.backbone,
-        allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json",
-                        "generation_config.json", "tokenizer*", "*.model",
-                        "vocab*", "merges*", "special_tokens*"])
-    print("backbone cached at:", path)
+        allow_patterns=weights + ["config.json", "generation_config.json",
+                                  "tokenizer*", "*.model", "vocab*", "merges*",
+                                  "special_tokens*"])
+    print(f"backbone cached at: {path}  (format: {'safetensors' if has_st else 'bin'})")
 else:
     print("smoke mode - tiny backbone downloads in seconds, no pre-fetch needed")""")
 

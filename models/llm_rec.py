@@ -72,6 +72,16 @@ class LLMRec(nn.Module):
             kwargs["device_map"] = {"": device}  # 4-bit models can't be .to()-moved
         elif device == "cuda":
             kwargs["torch_dtype"] = half
+        # Repos without main-branch safetensors (e.g. lmsys/vicuna-7b-v1.5, which
+        # ships only .bin) make from_pretrained fetch an auto-converted safetensors
+        # copy from a Hub conversion PR — a 13.5GB duplicate that defeats any
+        # pre-download of the main branch. Prefer the repo's own weights instead.
+        try:
+            from huggingface_hub import list_repo_files
+            if not any(f.endswith(".safetensors") for f in list_repo_files(backbone)):
+                kwargs["use_safetensors"] = False
+        except Exception:
+            pass  # offline/local path: let from_pretrained decide
         base = AutoModelForCausalLM.from_pretrained(backbone, **kwargs)
         base.requires_grad_(False)  # backbone is always frozen; only LoRA trains
 
