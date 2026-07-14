@@ -54,6 +54,13 @@ class Config:
     # plateaus — which it did, at ~0.695 val.
     design2: bool = False
     qformer_align_pretrain: bool = False  # optional contrastive alignment before Phase 2
+    # Title-anchored alignment (auxiliary Phase-2/3 loss): pull the MEAN of the
+    # user soft tokens toward the mean LLM title-embedding of the FULL history
+    # (100 items; the prompt shows only 10) — tokens become readable by
+    # construction AND carry the 90 unshown titles. Item token is NOT anchored
+    # to its own title (that would be redundant with the prompt).
+    align_titles: bool = False
+    align_titles_weight: float = 0.1
     align_epochs: int = 3
     align_lr: float = 1e-3
 

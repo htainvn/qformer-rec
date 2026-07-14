@@ -173,6 +173,19 @@ def _val_scores(cfg, llm, sasrec, qformer, val_ds, device, hybrid):
                          progress=not cfg.smoke_test)  # 7B over full val is minutes-long
 
 
+@torch.no_grad()
+def build_title_vectors(llm, id2title, n_items, device):
+    """[n_items+1, llm_dim] mean input-embedding of each item's title text
+    (row 0 = zeros for padding). Frozen table: computed once, no gradients."""
+    dt = llm.model.get_input_embeddings().weight.dtype
+    tv = torch.zeros(n_items + 1, llm.llm_dim, dtype=torch.float32, device=device)
+    for iid in range(1, n_items + 1):
+        title = id2title.get(iid, f"item {iid}")
+        emb = llm._embed_text(f'"{title}"', add_bos=False)
+        tv[iid] = emb.float().mean(dim=0)
+    return tv
+
+
 def _selection_val_set(cfg, val_ds):
     """The validation set used for per-step checkpoint selection.
 
@@ -196,7 +209,8 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                     tracked_state_fn, llm_train: bool = True,
                     mix_hybrid_template: bool = False, weight_decay: float = 0.01,
                     eval_every: int | None = None,
-                    dense_until: int = 0, dense_every: int = 0) -> tuple[CheckpointSelector, dict]:
+                    dense_until: int = 0, dense_every: int = 0,
+                    title_vecs=None) -> tuple[CheckpointSelector, dict]:
     """One training loop shared by Phases 1/2/2b — they differ only in which
     parameters train and whether soft tokens are injected.
 
@@ -249,6 +263,15 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                 e_i = sasrec.item_embedding(b.iid)
                 u_tok, i_tok = qformer(H, b.his_mask, e_i)
                 p = llm(b.his_titles, b.target_titles, u_tok, i_tok)
+                if title_vecs is not None:
+                    # anchor mean user token to the mean title-embedding of the
+                    # FULL history (prompt shows only prompt_titles of them)
+                    denom = b.his_mask.sum(1, keepdim=True).clamp(min=1)
+                    tgt = (title_vecs[b.his] * b.his_mask.unsqueeze(-1)).sum(1) / denom
+                    align = torch.nn.functional.mse_loss(
+                        u_tok.float().mean(dim=1), tgt.detach())
+                else:
+                    align = None
             elif mix_hybrid_template and step % 2 == 1:
                 B = len(b.target_titles)
                 u0 = torch.zeros(B, qformer.n_queries, llm.llm_dim, device=device)
@@ -259,6 +282,8 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
             loss, bce, pair = combined_loss(p, b.label, b.uid,
                                             lambda_pair=cfg.lambda_pair,
                                             margin=cfg.pair_margin)
+            if hybrid and title_vecs is not None:
+                loss = loss + cfg.align_titles_weight * align
             scaler.scale(loss / grad_accum).backward()
             history["loss"].append(loss.item())
             history["bce"].append(bce.item()); history["pair"].append(pair.item())
@@ -422,6 +447,13 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
                   {"params": [p for p in sasrec.parameters() if p.requires_grad],
                    "lr": cfg.sasrec_lr_2b}]
 
+    title_vecs = (build_title_vectors(llm, train_ds.id2title,
+                                      sasrec.item_emb.num_embeddings - 1
+                                      if hasattr(sasrec, "item_emb")
+                                      else sasrec.sasrec.item_emb.num_embeddings - 1,
+                                      device)
+                  if cfg.align_titles else None)
+
     def tracked_state():
         # track everything the soup must average: QFormer (+SASRec in 2b)
         sd = {f"qformer.{k}": v for k, v in qformer.state_dict().items()}
@@ -438,7 +470,8 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         weight_decay=cfg.phase2_weight_decay,
         eval_every=cfg.phase2_eval_every_steps,
         dense_until=cfg.phase2_dense_eval_until,
-        dense_every=cfg.phase2_dense_eval_every)
+        dense_every=cfg.phase2_dense_eval_every,
+        title_vecs=title_vecs)
 
     # final model = GREEDY soup: candidates join only if they improve val UAUC
     sel_ds, sel_users = _selection_val_set(cfg, val_ds)
