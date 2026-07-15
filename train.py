@@ -566,6 +566,11 @@ def train_phase3(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         qformer.load_state_dict({k[len("qformer."):]: v for k, v in sd.items()
                                  if k.startswith("qformer.")})
 
+    # snapshot the Phase-2 final model BEFORE any Phase-3 update: Phase 3 must
+    # beat it under the guarded rule or the pipeline reverts (observed failure:
+    # phase 3 traded -0.5pt UAUC for +0.35pt AUC and was kept unconditionally)
+    pre_phase3 = {k: v.detach().cpu().clone() for k, v in tracked_state().items()}
+
     selector, history = _llm_stage_loop(
         cfg, llm, sasrec, qformer, train_ds, val_ds, device,
         hybrid=True, params=params, lr=cfg.phase3_lr, epochs=cfg.phase3_epochs,
@@ -586,6 +591,18 @@ def train_phase3(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         return (a, uu) if cfg.sel_metric == "auc" else (uu, a)
 
     soup = selector.greedy_soup(_eval, cfg.top_k_soup)
+
+    # cross-phase guard: keep Phase 3 only if it beats the Phase-2 model on the
+    # primary metric with the guard intact — same admission rule as the soup
+    p3_p, p3_g = _eval(soup)
+    p2_p, p2_g = _eval(pre_phase3)
+    if p3_p > p2_p and p3_g >= p2_g - cfg.sel_guard_tol:
+        print(f"[phase3] keeps: {cfg.sel_metric} {p3_p:.4f}/{p3_g:.4f} beats "
+              f"phase-2 {p2_p:.4f}/{p2_g:.4f} with guard intact")
+    else:
+        print(f"[phase3] REVERTED to phase-2 model: phase-3 {p3_p:.4f}/{p3_g:.4f} "
+              f"vs phase-2 {p2_p:.4f}/{p2_g:.4f} (primary or guard failed)")
+        soup = pre_phase3
     load_state(soup)
     out = Path(cfg.out_dir); out.mkdir(exist_ok=True, parents=True)
     torch.save(soup, out / "phase3.pt")
