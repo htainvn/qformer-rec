@@ -41,6 +41,10 @@ class Config:
     phase0_neg_ratio: int = 0        # 0 = use labeled samples as-is (CTR-style BCE)
 
     # ---- QFormer bridge -----------------------------------------------------
+    # bridge="mlp" swaps in CoLLM's original mapping (MLP of SASRec's last
+    # state -> 1 soft token) with everything else identical — the controlled
+    # baseline arm for the paper's core MLP-vs-QFormer claim.
+    bridge: str = "qformer"          # "qformer" | "mlp"
     n_queries: int = 4               # N learnable queries -> N <UserID> soft tokens
     qformer_layers: int = 2
     qformer_heads: int = 4

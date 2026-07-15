@@ -164,3 +164,32 @@ class QFormerBridge(nn.Module):
             u = self.final_norm(q).mean(dim=1)              # [B, hidden]
             outs.append((u * e_i_matrix[j]).sum(-1))        # dot with candidate
         return torch.stack(outs, dim=1)                     # [B, B]
+
+
+class MLPBridge(nn.Module):
+    """CoLLM's original mapping module, as the controlled baseline arm:
+    MLP(SASRec last state) -> ONE <UserID> soft token (vs the QFormer's N
+    tokens cross-attended over ALL positions). Same item projection and the
+    same zero-init no-op start, so the ONLY difference vs QFormerBridge is
+    the mapping mechanism — the paper's core ablation."""
+
+    def __init__(self, emb_dim: int = 64, llm_dim: int = 4096, **_ignored):
+        super().__init__()
+        self.n_queries = 1
+        mid = max(8 * emb_dim, 512)
+        self.user_proj = nn.Sequential(
+            nn.Linear(emb_dim, mid), nn.GELU(), nn.Linear(mid, llm_dim))
+        self.item_proj = nn.Sequential(
+            nn.Linear(emb_dim, mid), nn.GELU(), nn.Linear(mid, llm_dim))
+        for proj in (self.user_proj, self.item_proj):
+            nn.init.zeros_(proj[-1].weight)
+            nn.init.zeros_(proj[-1].bias)
+
+    def forward(self, H: torch.Tensor, his_mask: torch.Tensor, e_i: torch.Tensor):
+        # CoLLM pools the history to SASRec's LAST state (left-padded -> index -1)
+        u = H[:, -1, :]
+        if u.size(-1) != self.user_proj[0].in_features:   # Design-2 fused KV guard
+            u = u[:, :self.user_proj[0].in_features]
+        user_token = self.user_proj(u).unsqueeze(1)        # [B, 1, llm_dim]
+        item_token = self.item_proj(e_i).unsqueeze(1)      # [B, 1, llm_dim]
+        return user_token, item_token

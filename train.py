@@ -619,13 +619,18 @@ def build_models(cfg: Config, n_items: int, device: str):
                  cfg.lora_targets, cfg.load_4bit, device)
     sasrec = SASRec(n_items, cfg.emb_dim, cfg.max_his_len, cfg.sasrec_blocks,
                     cfg.sasrec_heads, cfg.sasrec_dropout).to(device)
-    # Design 2: fused [H_sasrec ; D_din] keys/values, target-agnostic queries
-    # (the target already weights DIN's values); Design 1: FiLM per config.
-    qformer = QFormerBridge(cfg.emb_dim, llm.llm_dim, cfg.n_queries,
-                            cfg.qformer_layers, cfg.qformer_heads,
-                            cfg.qformer_dropout,
-                            target_aware=cfg.target_aware and not cfg.design2,
-                            kv_dim=2 * cfg.emb_dim if cfg.design2 else None).to(device)
+    if cfg.bridge == "mlp":
+        # CoLLM's original mapping — controlled baseline arm
+        from models.qformer import MLPBridge
+        qformer = MLPBridge(cfg.emb_dim, llm.llm_dim).to(device)
+    else:
+        # Design 2: fused [H_sasrec ; D_din] keys/values, target-agnostic
+        # queries (target already weights DIN's values); Design 1: FiLM.
+        qformer = QFormerBridge(cfg.emb_dim, llm.llm_dim, cfg.n_queries,
+                                cfg.qformer_layers, cfg.qformer_heads,
+                                cfg.qformer_dropout,
+                                target_aware=cfg.target_aware and not cfg.design2,
+                                kv_dim=2 * cfg.emb_dim if cfg.design2 else None).to(device)
     return llm, sasrec, qformer
 
 
