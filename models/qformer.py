@@ -47,6 +47,39 @@ class FiLM(nn.Module):
         return (1.0 + dgamma).unsqueeze(1) * queries + beta.unsqueeze(1)
 
 
+def _warm_proj(llm_dim: int, mid: int) -> nn.Sequential:
+    """SeLLa-Rec's Proj^(W->L): maps the LLM-distilled semantic vector of the
+    TARGET item to the <WarmID> soft token. The paper uses a full d_L x d_L
+    linear; we bottleneck (llm_dim -> mid -> llm_dim) and ZERO-INIT the output
+    layer for the same reasons as user_proj/item_proj below — a 4096^2 map is
+    17M params of overfit surface on 34k rows, and the zero-init keeps the
+    warm token an exact no-op at Phase-2 step 0."""
+    proj = nn.Sequential(nn.Linear(llm_dim, mid), nn.GELU(), nn.Linear(mid, llm_dim))
+    nn.init.zeros_(proj[-1].weight)
+    nn.init.zeros_(proj[-1].bias)
+    return proj
+
+
+class _WarmTokenMixin:
+    """Shared <WarmID> plumbing. `sem_vecs` is a NON-persistent buffer (a data
+    table distilled from the Phase-1 LLM, not a learned weight): excluded from
+    state_dict, so checkpoint soups/loads are unaffected; assigned once in
+    run_all_phases after distillation."""
+
+    def _init_warm(self, llm_dim: int, mid: int, warm: bool):
+        self.register_buffer("sem_vecs", None, persistent=False)
+        self.warm_proj = _warm_proj(llm_dim, mid) if warm else None
+
+    def warm_token(self, iid: torch.Tensor) -> torch.Tensor | None:
+        """[B] target item ids -> [B, 1, llm_dim] <WarmID> token, or None when
+        the warm arm is off or the semantic table has not been distilled yet
+        (Phase 1 runs before distillation by construction)."""
+        if self.warm_proj is None or self.sem_vecs is None:
+            return None
+        sem = self.sem_vecs[iid].to(self.warm_proj[0].weight.dtype)
+        return self.warm_proj(sem).unsqueeze(1)
+
+
 class QFormerLayer(nn.Module):
     """One block = self-attention over queries + cross-attention (queries -> H) + FFN.
 
@@ -80,10 +113,11 @@ class QFormerLayer(nn.Module):
         return q
 
 
-class QFormerBridge(nn.Module):
+class QFormerBridge(_WarmTokenMixin, nn.Module):
     def __init__(self, emb_dim: int = 64, llm_dim: int = 4096, n_queries: int = 4,
                  n_layers: int = 2, n_heads: int = 4, dropout: float = 0.1,
-                 target_aware: bool = True, kv_dim: int | None = None):
+                 target_aware: bool = True, kv_dim: int | None = None,
+                 warm: bool = False):
         super().__init__()
         self.target_aware = target_aware
         self.n_queries = n_queries
@@ -116,6 +150,7 @@ class QFormerBridge(nn.Module):
         for proj in (self.user_proj, self.item_proj):
             nn.init.zeros_(proj[-1].weight)
             nn.init.zeros_(proj[-1].bias)
+        self._init_warm(llm_dim, mid, warm)
 
     def forward(self, H: torch.Tensor, his_mask: torch.Tensor, e_i: torch.Tensor):
         """H: [B, L, d] SASRec states; his_mask: [B, L] 1=real; e_i: [B, d].
@@ -166,14 +201,18 @@ class QFormerBridge(nn.Module):
         return torch.stack(outs, dim=1)                     # [B, B]
 
 
-class MLPBridge(nn.Module):
+class MLPBridge(_WarmTokenMixin, nn.Module):
     """CoLLM's original mapping module, as the controlled baseline arm:
     MLP(SASRec last state) -> ONE <UserID> soft token (vs the QFormer's N
     tokens cross-attended over ALL positions). Same item projection and the
     same zero-init no-op start, so the ONLY difference vs QFormerBridge is
-    the mapping mechanism — the paper's core ablation."""
+    the mapping mechanism — the paper's core ablation.
 
-    def __init__(self, emb_dim: int = 64, llm_dim: int = 4096, **_ignored):
+    warm=True on THIS arm approximates SeLLa-Rec's own design (MLP projection
+    + <Warm_ID>), giving a faithful-baseline vs QFormer+SeLLa comparison."""
+
+    def __init__(self, emb_dim: int = 64, llm_dim: int = 4096, warm: bool = False,
+                 **_ignored):
         super().__init__()
         self.n_queries = 1
         mid = max(8 * emb_dim, 512)
@@ -184,6 +223,7 @@ class MLPBridge(nn.Module):
         for proj in (self.user_proj, self.item_proj):
             nn.init.zeros_(proj[-1].weight)
             nn.init.zeros_(proj[-1].bias)
+        self._init_warm(llm_dim, mid, warm)
 
     def forward(self, H: torch.Tensor, his_mask: torch.Tensor, e_i: torch.Tensor):
         # CoLLM pools the history to SASRec's LAST state (left-padded -> index -1)

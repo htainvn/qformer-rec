@@ -36,6 +36,10 @@ SEG_B = (". Using all available information, make a prediction about whether the
          "user would enjoy the movie titled {target} with the feature ")
 SEG_C = "? Answer with \"Yes\" or \"No\". \n#Answer:"
 
+# SeLLa-Rec's <Warm_ID> slot: inserted between the item token and SEG_C only
+# when warm tokens are passed, so the non-warm template stays byte-identical.
+SEG_W = " and the semantic feature "
+
 # Phase-1 text-only variant: same task phrasing with the ID clauses dropped.
 TEXT_ONLY = ("#Question: A user has given high ratings to the following movies: "
              "{his}. Using all available information, make a prediction about "
@@ -143,11 +147,14 @@ class LLMRec(nn.Module):
 
     def forward(self, his_titles: list[list[str]], target_titles: list[str],
                 user_tokens: torch.Tensor | None = None,
-                item_tokens: torch.Tensor | None = None) -> torch.Tensor:
+                item_tokens: torch.Tensor | None = None,
+                warm_tokens: torch.Tensor | None = None) -> torch.Tensor:
         """Returns P("Yes") in [0, 1], shape [B].
 
         Hybrid mode when user_tokens/item_tokens are given (Phase 2 / eval);
         text-only mode when both are None (Phase 1 warm-up).
+        warm_tokens (SeLLa-Rec arm): [B, 1, llm_dim] <WarmID> tokens appended
+        after the item token via the SEG_W clause.
         """
         hybrid = user_tokens is not None
         dt = self.model.get_input_embeddings().weight.dtype
@@ -155,13 +162,17 @@ class LLMRec(nn.Module):
         for b in range(len(target_titles)):
             if hybrid:
                 a, m, c = fill_titles(his_titles[b], target_titles[b], hybrid=True)
-                row = torch.cat([
+                parts = [
                     self._embed_text(a, add_bos=True),
                     user_tokens[b].to(dt),          # N x <UserID>
                     self._embed_text(m, add_bos=False),
                     item_tokens[b].to(dt),          # 1 x <TargetItemID>
-                    self._embed_text(c, add_bos=False),
-                ], dim=0)
+                ]
+                if warm_tokens is not None:         # SeLLa arm: 1 x <WarmID>
+                    parts += [self._embed_text(SEG_W, add_bos=False),
+                              warm_tokens[b].to(dt)]
+                parts.append(self._embed_text(c, add_bos=False))
+                row = torch.cat(parts, dim=0)
             else:
                 text = fill_titles(his_titles[b], target_titles[b], hybrid=False)
                 row = self._embed_text(text, add_bos=True)

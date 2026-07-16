@@ -67,6 +67,39 @@ Migration path if needed: pre-train DIN with the same Phase-0 CTR objective,
 freeze both encoders, widen `QFormerLayer`'s cross-attention `kdim/vdim` to
 `d + d_din`, set `target_aware=False`, and rerun Phase 2 only.
 
+## SeLLa-Rec arm (arXiv:2504.10107) — semantic alignment, recast around the QFormer
+
+SeLLa-Rec's three transferable ideas, adapted so the QFormer plays the role of
+its projection layer (flags in `config.py`, all off by default):
+
+1. **Semantic distillation** (`build_semantic_vectors`): after Phase 1, each
+   item's semantic vector `e_i^L` = the LoRA-tuned LLM's **last hidden state**
+   over the quoted title — the OUTPUT space the task-adapted reader reasons
+   in, unlike `build_title_vectors`' frozen input-embedding mean.
+2. **Stage-2 contrastive pre-alignment** (`sella_prealign`): before Phase 2,
+   InfoNCE pulls `item_proj(e_i)` toward `sem[target]` and the mean user token
+   toward the history-mean of `sem` (the user side is our QFormer-role
+   extension — MF user embeddings have no text, a title history does). An MSE
+   anchor keeps token norms at semantic-embedding scale (cosine InfoNCE is
+   norm-blind; out-of-scale tokens are the documented Phase-2 failure mode).
+   This is SeLLa's warm-started projection; it deliberately trades away the
+   zero-init no-op start, and the Phase-2 zero-token floor still guarantees
+   the final model never regresses below Phase 1.
+3. **`<WarmID>` token** (`sella_warm_token`): a third soft token
+   `warm_proj(sem[target])` spliced after `<TargetItemID>` ("and the semantic
+   feature ..."), zero-init so Phase 2 starts as a no-op. Phase 1's template
+   mix includes the 3-slot prompt with a zero warm token, so there is no
+   template-shift penalty. `warm_proj` stays untrained until Phase 2 (SeLLa
+   keeps `Proj^(W→L)` random until its Stage 3).
+
+Stage mapping: SeLLa Stage 1 (LoRA task adaptation) = Phase 1; Stage 2
+(collab-semantic alignment) = `sella_prealign`; Stage 3 (projection training,
+LLM+LoRA frozen) = Phase 2. `sella_anchor` additionally switches the
+`align_titles` Phase-2 auxiliary anchor to the distilled vectors. The
+faithful-to-paper baseline is `bridge="mlp"` + `sella_prealign` +
+`sella_warm_token`; the same flags on `bridge="qformer"` are the paper's ideas
+composed with the N-token cross-attentive bridge.
+
 ## Measured negative results (ML-1M, val, UAUC-selected — so nobody re-tries them blind)
 
 | Idea | Result | Verdict |

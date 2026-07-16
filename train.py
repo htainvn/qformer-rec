@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader
 
 from config import Config
 from data import load_data, collate, UserGroupedBatchSampler
-from losses import combined_loss, bce_loss
+from losses import combined_loss, bce_loss, info_nce
 from models import SASRec, QFormerBridge, LLMRec
 from models.din import DINEncoder, FusedEncoder
 from selection import CheckpointSelector
@@ -186,6 +186,93 @@ def build_title_vectors(llm, id2title, n_items, device):
     return tv
 
 
+@torch.no_grad()
+def build_semantic_vectors(llm, id2title, n_items, device, batch_size=64):
+    """SeLLa-Rec's semantic distillation: e_i^L = the LAST HIDDEN STATE of the
+    (Phase-1 LoRA-tuned) LLM over the item's quoted title — the next-token
+    embedding the fine-tuned reader itself associates with the item.
+
+    Contrast with build_title_vectors (frozen INPUT-embedding mean): these live
+    in the LLM's OUTPUT semantic space, which is the alignment target SeLLa-Rec
+    prescribes. Must run AFTER Phase 1 so the distilled space reflects the
+    task-adapted reader. [n_items+1, llm_dim] fp32; row 0 = zeros (padding)."""
+    llm.eval()
+    tv = torch.zeros(n_items + 1, llm.llm_dim, dtype=torch.float32, device=device)
+    ids = list(range(1, n_items + 1))
+    for s in range(0, len(ids), batch_size):
+        chunk = ids[s:s + batch_size]
+        rows = []
+        for iid in chunk:
+            title = id2title.get(iid, f"item {iid}")
+            rows.append(llm._embed_text(f'"{title}"', add_bos=True))
+        embeds, attn, pos = llm._pack(rows)
+        out = llm.model(inputs_embeds=embeds, attention_mask=attn,
+                        position_ids=pos, output_hidden_states=True)
+        # left-padded -> every row's final real token sits at index -1
+        tv[chunk] = out.hidden_states[-1][:, -1, :].float()
+        if (s // batch_size) % 10 == 0:
+            print(f"[sella] distilled {min(s + batch_size, len(ids))}/{len(ids)} "
+                  f"item semantic vectors", flush=True)
+    return tv
+
+
+def sella_prealign(cfg: Config, sasrec, qformer, train_ds, device):
+    """SeLLa-Rec Stage 2, recast for the QFormer bridge: contrastively align
+    the bridge's OUTPUT tokens with the LLM-distilled semantic vectors before
+    Phase 2, so Phase 2 starts from a warm-started projection that already
+    lands in the region of LLM space the Phase-1 reader reasons in (the
+    paper's warm-init of Proj^(C->L), with the QFormer as the projector).
+
+      item side: item_proj(e_i)        <-> sem[target item]     (InfoNCE)
+      user side: mean of user tokens   <-> mean sem[history]    (InfoNCE)
+
+    The user side is our QFormer-role extension: SeLLa's MF user embeddings
+    have no text to align to, but here the history's distilled title vectors
+    define a semantic user profile. The MSE anchor keeps token NORMS at the
+    scale of real semantic embeddings (cosine InfoNCE is norm-blind, and
+    out-of-scale tokens are the documented Phase-2 failure mode). NOTE this
+    deliberately trades away the zero-init no-op start; the Phase-2 zero-token
+    floor still guarantees the final model never regresses below Phase 1.
+
+    warm_proj is excluded: SeLLa keeps Proj^(W->L) untrained until its Stage 3
+    (= our Phase 2), and zero-init is exactly that."""
+    sem = qformer.sem_vecs
+    qformer.requires_grad_(True)
+    sasrec.requires_grad_(False)
+    params = [p for n, p in qformer.named_parameters()
+              if not n.startswith("warm_proj")]
+    opt = torch.optim.AdamW(params, lr=cfg.sella_prealign_lr)
+    dl = make_loader(train_ds, cfg, min(32, cfg.phase2_batch_size * 4),
+                     grouped=False, seed=cfg.seed)
+    # eval mode for the same reasons as align_pretrain_qformer: deterministic
+    # init + the MPS SDPA dropout kernel gap. Gradients still flow.
+    sasrec.eval(); qformer.eval()
+    mse = torch.nn.functional.mse_loss
+    for epoch in range(cfg.sella_prealign_epochs):
+        losses = []
+        for b in dl:
+            b = b.to(device)
+            with torch.no_grad():
+                H = (sasrec.encode_history_target(b.his, b.his_mask, b.iid)
+                     if hasattr(sasrec, "encode_history_target")   # Design 2
+                     else sasrec.encode_history(b.his, b.his_mask))
+                e_i = sasrec.item_embedding(b.iid)
+            u_tok, i_tok = qformer(H, b.his_mask, e_i)
+            item_pred = i_tok.squeeze(1).float()
+            user_pred = u_tok.float().mean(dim=1)
+            item_tgt = sem[b.iid]
+            denom = b.his_mask.sum(1, keepdim=True).clamp(min=1)
+            user_tgt = (sem[b.his] * b.his_mask.unsqueeze(-1)).sum(1) / denom
+            loss = (info_nce(item_pred, item_tgt, cfg.sella_tau, ids=b.iid)
+                    + info_nce(user_pred, user_tgt, cfg.sella_tau, ids=b.uid)
+                    + cfg.sella_prealign_mse * (mse(item_pred, item_tgt)
+                                                + mse(user_pred, user_tgt)))
+            opt.zero_grad(); loss.backward(); opt.step()
+            losses.append(loss.item())
+        print(f"[sella-align] epoch {epoch + 1}/{cfg.sella_prealign_epochs} "
+              f"loss {np.mean(losses):.4f}", flush=True)
+
+
 def _selection_val_set(cfg, val_ds):
     """The validation set used for per-step checkpoint selection.
 
@@ -262,7 +349,11 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                      else sasrec.encode_history(b.his, b.his_mask))
                 e_i = sasrec.item_embedding(b.iid)
                 u_tok, i_tok = qformer(H, b.his_mask, e_i)
-                p = llm(b.his_titles, b.target_titles, u_tok, i_tok)
+                # SeLLa warm token: None unless the warm arm is on AND the
+                # semantic table has been distilled (i.e. never in Phase 1)
+                w_tok = qformer.warm_token(b.iid)
+                p = llm(b.his_titles, b.target_titles, u_tok, i_tok,
+                        warm_tokens=w_tok)
                 if title_vecs is not None:
                     # anchor mean user token to the mean title-embedding of the
                     # FULL history (prompt shows only prompt_titles of them)
@@ -276,7 +367,12 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                 B = len(b.target_titles)
                 u0 = torch.zeros(B, qformer.n_queries, llm.llm_dim, device=device)
                 i0 = torch.zeros(B, 1, llm.llm_dim, device=device)
-                p = llm(b.his_titles, b.target_titles, u0, i0)
+                # warm arm: Phase 1 must also see the 3-slot template with a
+                # zero <WarmID>, which is exactly what the zero-init warm_proj
+                # emits at Phase-2 step 0 — no template-shift penalty
+                w0 = (torch.zeros(B, 1, llm.llm_dim, device=device)
+                      if cfg.sella_warm_token else None)
+                p = llm(b.his_titles, b.target_titles, u0, i0, warm_tokens=w0)
             else:
                 p = llm(b.his_titles, b.target_titles)
             loss, bce, pair = combined_loss(p, b.label, b.uid,
@@ -447,12 +543,19 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
                   {"params": [p for p in sasrec.parameters() if p.requires_grad],
                    "lr": cfg.sasrec_lr_2b}]
 
-    title_vecs = (build_title_vectors(llm, train_ds.id2title,
-                                      sasrec.item_emb.num_embeddings - 1
-                                      if hasattr(sasrec, "item_emb")
-                                      else sasrec.sasrec.item_emb.num_embeddings - 1,
-                                      device)
-                  if cfg.align_titles else None)
+    title_vecs = None
+    if cfg.align_titles:
+        # sella_anchor: anchor to the DISTILLED semantic vectors (the LLM's
+        # output space) instead of the frozen input-embedding title means
+        if cfg.sella_anchor and getattr(qformer, "sem_vecs", None) is not None:
+            title_vecs = qformer.sem_vecs
+        else:
+            title_vecs = build_title_vectors(
+                llm, train_ds.id2title,
+                sasrec.item_emb.num_embeddings - 1
+                if hasattr(sasrec, "item_emb")
+                else sasrec.sasrec.item_emb.num_embeddings - 1,
+                device)
 
     def tracked_state():
         # track everything the soup must average: QFormer (+SASRec in 2b)
@@ -492,8 +595,11 @@ def train_phase2(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
     # (zero the projection OUTPUT layers -> tokens are identically 0) and adopt
     # it if it beats the learned soup on val UAUC. Guarantees final >= Phase 1.
     zkeys = set()
-    for nm in ("user_proj", "item_proj"):
-        last = len(getattr(qformer, nm)) - 1
+    for nm in ("user_proj", "item_proj", "warm_proj"):
+        proj = getattr(qformer, nm, None)
+        if proj is None:
+            continue
+        last = len(proj) - 1
         zkeys |= {f"qformer.{nm}.{last}.weight", f"qformer.{nm}.{last}.bias"}
     zero_state = {k: (torch.zeros_like(v) if k in zkeys else v) for k, v in soup.items()}
     (p_soup, g_soup), (p_zero, g_zero) = _soup_eval(soup), _soup_eval(zero_state)
@@ -622,7 +728,8 @@ def build_models(cfg: Config, n_items: int, device: str):
     if cfg.bridge == "mlp":
         # CoLLM's original mapping — controlled baseline arm
         from models.qformer import MLPBridge
-        qformer = MLPBridge(cfg.emb_dim, llm.llm_dim).to(device)
+        qformer = MLPBridge(cfg.emb_dim, llm.llm_dim,
+                            warm=cfg.sella_warm_token).to(device)
     else:
         # Design 2: fused [H_sasrec ; D_din] keys/values, target-agnostic
         # queries (target already weights DIN's values); Design 1: FiLM.
@@ -630,7 +737,8 @@ def build_models(cfg: Config, n_items: int, device: str):
                                 cfg.qformer_layers, cfg.qformer_heads,
                                 cfg.qformer_dropout,
                                 target_aware=cfg.target_aware and not cfg.design2,
-                                kv_dim=2 * cfg.emb_dim if cfg.design2 else None).to(device)
+                                kv_dim=2 * cfg.emb_dim if cfg.design2 else None,
+                                warm=cfg.sella_warm_token).to(device)
     return llm, sasrec, qformer
 
 
@@ -655,6 +763,16 @@ def run_all_phases(cfg: Config, seed: int | None = None):
 
     # Phase 1
     sel1, hist1 = train_phase1(cfg, llm, sasrec, qformer, train_ds, val_ds, device)
+
+    # SeLLa-Rec stages: distill item semantics from the Phase-1 reader, then
+    # (optionally) contrastively pre-align the bridge to them. Must follow
+    # Phase 1 — the distilled space has to reflect the task-adapted LoRA.
+    if cfg.sella_prealign or cfg.sella_warm_token or cfg.sella_anchor:
+        print("[sella] distilling item semantic vectors from the Phase-1 LLM")
+        qformer.sem_vecs = build_semantic_vectors(
+            llm, id2title, n_items, device, batch_size=cfg.sella_distill_batch)
+    if cfg.sella_prealign:
+        sella_prealign(cfg, sasrec, qformer, train_ds, device)
 
     # Optional alignment pre-training for the QFormer
     if cfg.qformer_align_pretrain and cfg.design2:
@@ -683,6 +801,9 @@ if __name__ == "__main__":
     ap.add_argument("--unfreeze_sasrec", action="store_true")
     ap.add_argument("--qformer_align_pretrain", action="store_true")
     ap.add_argument("--target_aware", type=int, default=1)
+    ap.add_argument("--sella_prealign", action="store_true")
+    ap.add_argument("--sella_warm_token", action="store_true")
+    ap.add_argument("--sella_anchor", action="store_true")
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
@@ -690,6 +811,11 @@ if __name__ == "__main__":
     cfg.unfreeze_sasrec = args.unfreeze_sasrec
     cfg.qformer_align_pretrain = args.qformer_align_pretrain
     cfg.target_aware = bool(args.target_aware)
+    cfg.sella_prealign = args.sella_prealign
+    cfg.sella_warm_token = args.sella_warm_token
+    cfg.sella_anchor = args.sella_anchor
+    if args.sella_anchor:
+        cfg.align_titles = True   # the anchor only exists inside align_titles
     if args.seed is not None:
         cfg.seed = args.seed
 

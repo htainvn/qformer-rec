@@ -46,6 +46,12 @@ of user representation.
 → QFormer-only training on the hybrid prompt), the loss adds a **within-user pairwise
 (BPR) term** that directly targets UAUC, and the final model is a **weight-averaged soup**
 of the top-k checkpoints selected by *smoothed* validation UAUC with a bootstrap noise band.
+
+**SeLLa-Rec arm** (arXiv:2504.10107, off by default; `models/README.md`): distill each
+item's semantic vector from the Phase-1 LoRA-tuned LLM's *output* space, contrastively
+pre-align the QFormer's tokens to those vectors before Phase 2 (`sella_prealign`), and
+splice a third `<WarmID>` soft token carrying the target item's distilled semantics into
+the prompt (`sella_warm_token`) — SeLLa-Rec's ideas with the QFormer as the projector.
 """)
 
 # ----------------------------------------------------------------------- colab
@@ -134,6 +140,11 @@ code("""# cfg = Config()                       # full ML-1M; defaults: Vicuna-7B
 # # cfg.load_4bit = True                 # QLoRA-quantize the frozen backbone if VRAM-bound
 # # cfg.unfreeze_sasrec = True           # Phase 2b variant
 # # cfg.design2 = True                   # DIN-fused values (measured no-go on ML-1M)
+#
+# # --- SeLLa-Rec arm (arXiv:2504.10107; see models/README.md) ---
+# # cfg.sella_prealign = True            # contrastive pre-alignment of the bridge
+# # cfg.sella_warm_token = True          # third <WarmID> soft token (target item)
+# # cfg.sella_anchor = True; cfg.align_titles = True  # distilled-anchor variant
 # SEEDS = list(range(cfg.seed, cfg.seed + cfg.n_seeds))
 # print(f"backbone={cfg.backbone}  seeds={SEEDS}")""")
 md("""### Pre-download the backbone
@@ -240,7 +251,17 @@ dominates early and the mapping module never learns to carry collaborative infor
 Checkpoint selection here is the robust machinery from `selection.py`: smoothed val UAUC
 + bootstrap noise band (AUC breaks ties only inside the band) + patience early stopping;
 the final model is the **weight-averaged soup** of the top-k checkpoints.""")
-code("""if cfg.qformer_align_pretrain:
+code("""# SeLLa-Rec stages (arXiv:2504.10107, recast around the QFormer): distill
+# item semantics from the Phase-1 reader, then pre-align the bridge to them.
+if cfg.sella_prealign or cfg.sella_warm_token or cfg.sella_anchor:
+    from train import build_semantic_vectors
+    qformer.sem_vecs = build_semantic_vectors(
+        llm, id2title, n_items, DEVICE, batch_size=cfg.sella_distill_batch)
+if cfg.sella_prealign:
+    from train import sella_prealign
+    sella_prealign(cfg, sasrec, qformer, train_ds, DEVICE)
+
+if cfg.qformer_align_pretrain:
     from train import align_pretrain_qformer
     align_pretrain_qformer(cfg, sasrec, qformer, train_ds, DEVICE)
 

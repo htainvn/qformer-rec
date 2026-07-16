@@ -187,9 +187,12 @@ def score_dataset(llm, sasrec, qformer, dataset, batch_size=16, device="cpu",
                  else sasrec.encode_history(b.his, b.his_mask))
             e_i = sasrec.item_embedding(b.iid)
             u_tok, i_tok = qformer(H, b.his_mask, e_i)
+            w_tok = (qformer.warm_token(b.iid)
+                     if hasattr(qformer, "warm_token") else None)  # SeLLa arm
             if zero_soft_tokens:
                 u_tok, i_tok = torch.zeros_like(u_tok), torch.zeros_like(i_tok)
-            p = llm(b.his_titles, b.target_titles, u_tok, i_tok)
+                w_tok = torch.zeros_like(w_tok) if w_tok is not None else None
+            p = llm(b.his_titles, b.target_titles, u_tok, i_tok, warm_tokens=w_tok)
         else:
             p = llm(b.his_titles, b.target_titles)
         uids.append(b.uid.cpu().numpy()); labels.append(b.label.cpu().numpy())

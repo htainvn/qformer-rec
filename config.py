@@ -58,6 +58,30 @@ class Config:
     # plateaus — which it did, at ~0.695 val.
     design2: bool = False
     qformer_align_pretrain: bool = False  # optional contrastive alignment before Phase 2
+    # ---- SeLLa-Rec adaptation (arXiv:2504.10107), recast around the QFormer --
+    # SeLLa-Rec's transferable ideas, with the QFormer playing the role of its
+    # projection layer: (1) distill per-item SEMANTIC vectors from the Phase-1
+    # LoRA-tuned LLM (last hidden state over the quoted title — the OUTPUT
+    # space the reader actually reasons in, unlike build_title_vectors' frozen
+    # INPUT-embedding mean); (2) contrastively pre-align the bridge's user/item
+    # tokens to those vectors BEFORE Phase 2 (their Stage 2 + warm-started
+    # projection); (3) a third <WarmID> soft token carrying the projected
+    # semantic vector of the TARGET item (their <Warm_ID>). All off by default;
+    # the full SeLLa arm = sella_prealign + sella_warm_token.
+    sella_prealign: bool = False     # Stage-2 InfoNCE alignment of the bridge
+    sella_prealign_epochs: int = 3
+    sella_prealign_lr: float = 1e-3
+    # cosine InfoNCE is norm-blind, but token NORM is load-bearing here (the
+    # zero-init note below/in qformer.py: out-of-scale tokens wreck the Phase-1
+    # prompt). The MSE term anchors aligned tokens to the scale of real
+    # semantic embeddings, so the warm-started Phase 2 starts readable.
+    sella_prealign_mse: float = 0.25
+    sella_tau: float = 0.07          # InfoNCE temperature
+    sella_warm_token: bool = False   # third <WarmID> soft token (target item)
+    sella_anchor: bool = False       # align_titles anchors to DISTILLED vectors
+                                     # instead of input-embedding title means
+                                     # (requires align_titles=True to matter)
+    sella_distill_batch: int = 64    # titles per LLM forward during distillation
     # Title-anchored alignment (auxiliary Phase-2/3 loss): pull the MEAN of the
     # user soft tokens toward the mean LLM title-embedding of the FULL history
     # (100 items; the prompt shows only 10) — tokens become readable by

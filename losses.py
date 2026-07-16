@@ -43,6 +43,26 @@ def pairwise_loss(p_yes: torch.Tensor, label: torch.Tensor, uid: torch.Tensor,
     return F.softplus(-d).mean()
 
 
+def info_nce(pred: torch.Tensor, target: torch.Tensor, tau: float = 0.07,
+             ids: torch.Tensor | None = None) -> torch.Tensor:
+    """In-batch InfoNCE on cosine similarity (SeLLa-Rec's alignment loss):
+    row i's positive is target i, every other row is a negative.
+
+    ids: optional entity ids of the rows — off-diagonal pairs with EQUAL ids
+    are masked out, so a batch containing the same item (or user) twice does
+    not create false negatives.
+    """
+    a = F.normalize(pred.float(), dim=-1)
+    t = F.normalize(target.float(), dim=-1)
+    logits = a @ t.t() / tau                                          # [B, B]
+    if ids is not None:
+        dup = (ids.unsqueeze(0) == ids.unsqueeze(1)) & ~torch.eye(
+            len(ids), dtype=torch.bool, device=ids.device)
+        logits = logits.masked_fill(dup, float("-inf"))
+    labels = torch.arange(len(a), device=a.device)
+    return F.cross_entropy(logits, labels)
+
+
 def combined_loss(p_yes, label, uid, lambda_pair: float = 0.5, margin: float = 0.0):
     """Returns (total, bce, pair) — the parts are logged separately in training."""
     bce = bce_loss(p_yes, label)
