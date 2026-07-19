@@ -127,6 +127,10 @@ LoRA(r=8, α=16 on q_proj/v_proj), 3 seeds, model soup of top-3 checkpoints. Exp
 hours per seed on a single A100 (use `load_4bit=True` to fit smaller GPUs).""")
 code("""# cfg = Config()                       # full ML-1M; defaults: Vicuna-7B, LoRA r16/a32
 #                                        # on 7 targets, 20 prompt titles, lambda_pair 0.8
+# cfg = Config.collm()                   # CoLLM/SeLLa-Rec reproduction protocol:
+#                                        # Qwen2-7B base, cosine lr 1e-3->8e-5, batch 16,
+#                                        # ~10k steps/stage, pure BCE, argmax-raw-AUC
+#                                        # selection, SASRec 4 heads / max_len 25
 # cfg.phase3_joint_finetune = True       # reader co-adaptation (recommended)
 # cfg.n_seeds = 3                        # 3-5 seeds for the reported mean ± std
 #

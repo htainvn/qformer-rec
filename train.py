@@ -273,6 +273,26 @@ def sella_prealign(cfg: Config, sasrec, qformer, train_ds, device):
               f"loss {np.mean(losses):.4f}", flush=True)
 
 
+def _cosine_warmup(opt, total_updates: int, warmup: int, min_lr: float,
+                   warmup_lr: float):
+    """CoLLM's linear_warmup_cosine_lr, as a multiplicative LambdaLR: linear
+    warmup_lr -> base lr over `warmup` optimizer updates, then cosine decay to
+    min_lr at `total_updates`. Multi-group optimizers (Phase 2b) scale each
+    group's base lr by the same factor."""
+    import math
+    base = opt.param_groups[0]["lr"]
+    # stages whose base lr is already below min_lr/warmup_lr (e.g. Phase 3 at
+    # 5e-5 vs min_lr 8e-5) must not have the schedule RAISE their lr
+    min_lr = min(min_lr, base)
+    warmup_lr = min(warmup_lr, base)
+    def f(step):
+        if step < warmup:
+            return (warmup_lr + (base - warmup_lr) * step / max(1, warmup)) / base
+        t = min((step - warmup) / max(1, total_updates - warmup), 1.0)
+        return (min_lr + 0.5 * (base - min_lr) * (1 + math.cos(math.pi * t))) / base
+    return torch.optim.lr_scheduler.LambdaLR(opt, f)
+
+
 def _selection_val_set(cfg, val_ds):
     """The validation set used for per-step checkpoint selection.
 
@@ -317,6 +337,9 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                    if params and isinstance(params[0], dict) else params)
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     dl = make_loader(train_ds, cfg, batch_size, grouped=True, seed=cfg.seed)
+    sched = (_cosine_warmup(opt, max(1, len(dl) * epochs // grad_accum),
+                            cfg.warmup_steps, cfg.min_lr, cfg.warmup_lr)
+             if cfg.lr_schedule == "cosine" else None)
     val_ds, val_users = _selection_val_set(cfg, val_ds)
 
     # Loss scaling iff the frozen backbone is fp16 (T4/V100 fallback): backward
@@ -388,6 +411,8 @@ def _llm_stage_loop(cfg, llm, sasrec, qformer, train_ds, val_ds, device, *,
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(flat_params, 1.0)
                 scaler.step(opt); scaler.update(); opt.zero_grad()
+                if sched is not None:
+                    sched.step()
             if step % cfg.log_every_steps == 0:
                 w = cfg.log_every_steps
                 rate = (step - step_last) / max(time.time() - t_last, 1e-9)
@@ -434,7 +459,7 @@ def train_phase1(cfg: Config, llm, sasrec, qformer, train_ds, val_ds, device):
         hybrid=False, params=params, lr=cfg.phase1_lr, epochs=cfg.phase1_epochs,
         batch_size=cfg.phase1_batch_size, grad_accum=cfg.phase1_grad_accum,
         tag="phase1", tracked_state_fn=llm.lora_state_dict,
-        mix_hybrid_template=True)
+        mix_hybrid_template=True, weight_decay=cfg.phase1_weight_decay)
 
     # Phase 1 selects a single best checkpoint (souping happens in Phase 2,
     # where the final model is assembled)
@@ -798,6 +823,8 @@ def run_all_phases(cfg: Config, seed: int | None = None):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke_test", action="store_true")
+    ap.add_argument("--collm", action="store_true",
+                    help="CoLLM/SeLLa-Rec reproduction protocol (Config.collm())")
     ap.add_argument("--unfreeze_sasrec", action="store_true")
     ap.add_argument("--qformer_align_pretrain", action="store_true")
     ap.add_argument("--target_aware", type=int, default=1)
@@ -807,7 +834,8 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
-    cfg = Config.smoke() if args.smoke_test else Config()
+    cfg = (Config.smoke() if args.smoke_test
+           else Config.collm() if args.collm else Config())
     cfg.unfreeze_sasrec = args.unfreeze_sasrec
     cfg.qformer_align_pretrain = args.qformer_align_pretrain
     cfg.target_aware = bool(args.target_aware)

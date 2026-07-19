@@ -105,6 +105,16 @@ class Config:
     lora_targets: tuple = ("q_proj", "v_proj")
     load_4bit: bool = False          # set True to QLoRA-quantize the frozen backbone
 
+    # ---- LR schedule (LLM stages) --------------------------------------------
+    # "" = constant lr (the house default). "cosine" = CoLLM's schedule:
+    # linear warmup from warmup_lr over warmup_steps, then cosine decay from
+    # the stage lr down to min_lr — verified in CoLLM's released yaml configs
+    # (init_lr 1e-3, min_lr 8e-5, warmup_lr 1e-5, warmup_steps 200).
+    lr_schedule: str = ""            # "" | "cosine"
+    min_lr: float = 8e-5
+    warmup_steps: int = 200
+    warmup_lr: float = 1e-5
+
     # ---- loss ---------------------------------------------------------------
     # Within-user pairwise (BPR) weight. MEASURED: 0.8 traded ~1pt val AUC for
     # no UAUC gain (BPR is invariant to per-user score shifts, so upweighting
@@ -122,6 +132,7 @@ class Config:
     phase1_epochs: int = 5           # upper bound; patience early-stops at the plateau
     phase1_batch_size: int = 8
     phase1_grad_accum: int = 4
+    phase1_weight_decay: float = 0.01
 
     # ---- Phase 2 (QFormer + projections on full prompt) ----------------------
     # Observed on the full run: lr 1e-3 reached +1.3 val AUC over the zero-token
@@ -206,6 +217,46 @@ class Config:
         if torch.backends.mps.is_available():
             return "mps"
         return "cpu"
+
+    @classmethod
+    def collm(cls) -> "Config":
+        """CoLLM / SeLLa-Rec reproduction protocol.
+
+        Sources: CoLLM's released train_configs/collm_pretrain_sasrec_ood_cc.yaml
+        (LoRA r8/a16 on q,v; init_lr 1e-3 cosine->8e-5, warmup 200; batch 16;
+        200 epochs x 50 iters ~= 10k optimizer steps ~= 5 epochs of the 33.9k
+        train rows; SASRec emb 64, 2 blocks, 4 heads, dropout 0.2, max_len 25;
+        pure BCE; checkpoint = argmax raw val AUC) and the SeLLa-Rec paper
+        (backbone re-based to Qwen2-7B BASE; same ood2 split and CoLLM eval).
+
+        Documented deviations (things we cannot or should not match):
+          * CoLLM's Vicuna numbers used Vicuna-7B v0 (LLaMA-1 deltas) — not
+            reproducible today; this preset targets the SeLLa Qwen2 track.
+          * Phase 0 still selects SASRec by val UAUC (our measured fix; their
+            AUC-selection costs ~1.7pt UAUC downstream).
+          * Selection evals use the 300-user val subsample (wall-clock); test
+            scoring is never subsampled.
+          * patience=20 as a runaway guard; their configs run all epochs.
+        The SeLLa arm itself = this preset + sella_prealign/sella_warm_token.
+        """
+        return cls(
+            backbone="Qwen/Qwen2-7B",
+            max_his_len=25,
+            sasrec_heads=4,
+            sasrec_dropout=0.2,
+            lambda_pair=0.0,             # CoLLM trains pure BCE
+            lr_schedule="cosine",
+            phase1_lr=1e-3, phase2_lr=1e-3,
+            phase1_epochs=5, phase2_epochs=5,
+            phase1_batch_size=16, phase1_grad_accum=1,
+            phase2_batch_size=16, phase2_grad_accum=1,
+            phase1_weight_decay=1e-3, phase2_weight_decay=1e-3,
+            sel_window=1,                # their selection: argmax RAW val AUC
+            top_k_soup=1,                # no soup
+            patience=20,
+            eval_every_steps=250, phase2_eval_every_steps=250,
+            phase2_dense_eval_until=0, phase2_dense_eval_every=0,
+        )
 
     @classmethod
     def smoke(cls) -> "Config":
